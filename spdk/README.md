@@ -1,13 +1,3 @@
-# Lightweight Near-Data Processing FrameworkBased on NVMe-over-Fabrics for BPE Tokenization
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-
-이 폴더는 **NVMe over Fabrics** 환경에서 **Byte-Pair Encoding (BPE)** 토큰화를 스토리지 서버 측으로 오프로드함으로써, 데이터 이동 비용을 현저히 줄이고 전처리 효율을 높이는 **Near-Data Processing (NDP)** 프레임워크를 제공합니다.
-
-![alt text](image.png)
-![alt text](image-1.png)
-
-본 프레임워크는:
 
 - **SPDK** 기반 사용자 공간 NVMe-oF 타겟을 이용해 호스트-스토리지 통신을 폴링 기반 커널 바이패스 방식으로 처리  
 - **System V Shared Memory** 인터페이스를 통해 I/O와 토큰화 프로세스를 경량화된 유저 스페이스 간에 직접 연결  
@@ -16,7 +6,7 @@
 → **Network traffic 최대 52%**, **Disk I/O 시간 14% 절감**를 달성했습니다.
 
 # 1. BPE 설정
-본 bpe_process 폴더는 의존성을 가집니다.!
+본 bpe_process 폴더는 의존성을 가집니다.
 BPE 구현은 외부 토크나이저 라이브러리를 활용합니다. 
 위 프로젝트는 BPE 토큰화 기능을 위해 mlc-ai/tokenizers-cpp 라이브러리에 의존합니다. 이 라이브러리는 Hugging Face Tokenizers의 C++ 포팅으로, 다음과 같은 특징을 제공합니다
 

@@ -20,6 +20,7 @@
 SPDK를 기반으로 플랫폼을 구성하였는데, SPDK라는 프레임워크 채용의 주목적은 사용자 공간에서 구현한 전처리 런타임과 연결하기 위해서이다. 사용자 공간에서 프로세스를 구현하면 기존 라이브러리와 커널 인터페이스를 활용하기 때문에 구현이 용이하다. 
 
 <img width="813" height="309" alt="image" src="https://github.com/user-attachments/assets/259a1470-3139-4fc4-ba13-7aa2193d3001" />
+
 제안하는 아이디어의 개요는 위와 같으며 자세한 아키텍트는 아래 그림에 설명된다. 
 
 <img width="920" height="475" alt="image" src="https://github.com/user-attachments/assets/ea1674bc-fa6b-439a-a09d-ac1083476818" />

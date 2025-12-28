@@ -28,5 +28,6 @@ SPDK를 기반으로 플랫폼을 구성하였는데, SPDK라는 프레임워크
 구현의 특징은 비동기적인 데이터 교환이다. 이는 SPDK 특징에서 기인한 것으로 SPDK는 폴링 기반 리액터(쓰레드)를 기반으로 동작하기 때문에
 내부 로직에서 블로킹이 발생하면 안된다. 그러나 테스트결과 메시지 큐와 공유 메모리 기반 데이터 교환에서 리액터가 전부 관여하는 경우 블로킹이 발생하는 것을 확인하였다.
 이를 방지하기 위해 별도의 폴러를 배치하여 I/O 완료 작업은 폴러에서 수행하여 부하를 줄였다.
+<img width="523" height="235" alt="image" src="https://github.com/user-attachments/assets/59506aca-6e92-4338-a026-e1dca236fac8" />
 
-<img width="444" height="334" alt="image" src="https://github.com/user-attachments/assets/cfbd3fc3-a8ba-46de-8eb8-b605ed9704bc" />
+<img width="517" height="161" alt="image" src="https://github.com/user-attachments/assets/e9a05eb9-29c2-472b-a818-83aed8010c4a" />

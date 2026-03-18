@@ -124,6 +124,35 @@ static inline double now_us(void) {
     return tv.tv_sec * 1e6 + tv.tv_usec;
 }
 
+static char *
+bpe_attach_slot_segment(key_t key, uint32_t slot, const char *label)
+{
+    int id = shmget(key, SHM_SIZE, IPC_CREAT | 0660);
+    if (id < 0) {
+        SPDK_ERRLOG("%s shmget failed for slot %u: %s\n", label, slot, spdk_strerror(errno));
+        return NULL;
+    }
+
+    struct shmid_ds ds = {};
+    if (shmctl(id, IPC_STAT, &ds) != 0) {
+        SPDK_ERRLOG("%s shmctl(IPC_STAT) failed for slot %u: %s\n",
+                    label, slot, spdk_strerror(errno));
+        return NULL;
+    }
+    if ((size_t)ds.shm_segsz != SHM_SIZE) {
+        SPDK_ERRLOG("%s shm size mismatch for slot %u: expected %u, got %zu\n",
+                    label, slot, SHM_SIZE, (size_t)ds.shm_segsz);
+        return NULL;
+    }
+
+    void *ptr = shmat(id, NULL, 0);
+    if (ptr == (void *)-1) {
+        SPDK_ERRLOG("%s shmat failed for slot %u: %s\n", label, slot, spdk_strerror(errno));
+        return NULL;
+    }
+    return (char *)ptr;
+}
+
 static void
 nvmf_ctrlr_process_io_cmd_resubmit(void *arg);
 static bool
@@ -151,20 +180,11 @@ static void bpe_ipc_init_once(void)
         abort();
     }
     for (uint32_t s = 0; s < NUM_SLOTS; s++) {
-        int idr = shmget(SHM_READ_KEY  + s, SHM_SIZE, IPC_CREAT | 0660);
-        int idw = shmget(SHM_WRITE_KEY + s, SHM_SIZE, IPC_CREAT | 0660);
-        if (idr < 0 || idw < 0) {
-            SPDK_ERRLOG("shmget failed slot %u: %s\n", s, spdk_strerror(errno));
+        g_shm_read[s] = bpe_attach_slot_segment(SHM_READ_KEY + s, s, "read");
+        g_shm_write[s] = bpe_attach_slot_segment(SHM_WRITE_KEY + s, s, "write");
+        if (g_shm_read[s] == NULL || g_shm_write[s] == NULL) {
             abort();
         }
-        void *pr = shmat(idr, NULL, 0);
-        void *pw = shmat(idw, NULL, 0);
-        if (pr == (void*)-1 || pw == (void*)-1) {
-            SPDK_ERRLOG("shmat failed slot %u: %s\n", s, spdk_strerror(errno));
-            abort();
-        }
-        g_shm_read[s]  = (char*)pr;
-        g_shm_write[s] = (char*)pw;
     }
     inited = true;
 }

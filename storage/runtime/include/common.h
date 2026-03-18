@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <sys/ipc.h>
@@ -38,6 +39,9 @@ struct BpeRuntimeStats {
     std::array<std::uint64_t, NUM_SLOTS> per_slot_bytes_out{};
 };
 
+static_assert(sizeof(BpeRuntimeStats) <= STATS_SHM_SIZE,
+              "BpeRuntimeStats no longer fits in the stats shared memory segment");
+
 struct __attribute__((packed)) bpe_msg_req {
     long msg_type;      // == 1
     std::uint32_t total_len;
@@ -57,10 +61,30 @@ enum {
     BPE_RESP_MSZ = static_cast<int>(sizeof(bpe_msg_resp) - sizeof(long)),
 };
 
+enum class InputMode : std::uint32_t {
+    kText = 0,
+    kArrow = 1,
+};
+
+// Arrow mode does not receive a full Arrow IPC/file payload.
+// It receives bytes from the Arrow text values buffer path described by
+// `compute/src/extent-index.cpp`. Optional framing allows the producer to
+// identify the valid subrange inside an aligned storage chunk.
+struct __attribute__((packed)) ArrowChunkHeader {
+    std::uint32_t magic = 0x41525458U; // "ARTX"
+    std::uint16_t version = 1;
+    std::uint16_t reserved = 0;
+    std::uint32_t payload_offset = 0;
+    std::uint32_t payload_length = 0;
+    std::uint64_t data_range_offset = 0;
+    std::int64_t batch_index = -1;
+    std::int64_t num_rows = -1;
+};
+
 class ShmSlotWorker {
 public:
     ShmSlotWorker() = default;
-    ShmSlotWorker(std::uint32_t slot, char* read_ptr, char* write_ptr);
+    ShmSlotWorker(std::uint32_t slot, char* read_ptr, char* write_ptr, InputMode mode);
 
     std::uint32_t Process(std::uint32_t input_len) const;
     std::uint32_t slot() const { return slot_; }
@@ -69,6 +93,7 @@ private:
     std::uint32_t slot_ = 0;
     char* read_ptr_ = nullptr;
     char* write_ptr_ = nullptr;
+    InputMode mode_ = InputMode::kText;
 };
 
 class SharedMemorySlots {
@@ -79,7 +104,8 @@ public:
     SharedMemorySlots(const SharedMemorySlots&) = delete;
     SharedMemorySlots& operator=(const SharedMemorySlots&) = delete;
 
-    std::vector<ShmSlotWorker> CreateWorkers() const;
+    std::vector<ShmSlotWorker> CreateWorkers(InputMode mode) const;
+    std::vector<ShmSlotWorker> CreateWorkers() const { return CreateWorkers(InputMode::kText); }
 
 private:
     std::array<int, NUM_SLOTS> read_ids_{};

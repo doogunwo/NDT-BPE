@@ -49,5 +49,6 @@ clean:
 
 # 공유 메모리 삭제 (디버깅을 위한 추가 명령어)
 clean_shm:
-	ipcrm -M 5678
-	ipcrm -M 5679
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1000)) $$((0x103f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1200)) $$((0x123f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@ipcrm -M 0x2000 2>/dev/null || true

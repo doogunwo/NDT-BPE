@@ -45,6 +45,7 @@ ext_modules = [
             str(ROOT / "src" / "bindings.cpp"),
             str(ROOT / "src" / "arrow_text_dump_lib.cpp"),
             str(ROOT / "src" / "extent-index.cpp"),
+            str(ROOT / "src" / "fallocate.cpp"),
             str(ROOT / "src" / "io-uring.cpp"),
             str(ROOT / "src" / "fiemap_schedule.cpp"),
         ],

@@ -60,24 +60,33 @@ fi
 echo "[INFO] Waiting for device ${DEV} to appear..."
 sleep 2
 
+detect_spdk_dev() {
+  sudo nvme list | awk '/SPDK bdev Controller/ {print $1; exit}'
+}
+
+ACTUAL_DEV="$(detect_spdk_dev || true)"
+if [[ -z "${ACTUAL_DEV}" ]]; then
+  ACTUAL_DEV="${DEV}"
+fi
+
 # 장치가 실제로 생겼는지 확인
-if [ ! -b "${DEV}" ]; then
-    echo "[FATAL] Device ${DEV} not found after connection!"
+if [ ! -b "${ACTUAL_DEV}" ]; then
+    echo "[FATAL] Device ${ACTUAL_DEV} not found after connection!"
     exit 1
 fi
 
-echo "[INFO] Using device: ${DEV}"
+echo "[INFO] Using device: ${ACTUAL_DEV}"
 sudo mkdir -p "${MNT}"
 
 # 파일시스템 확인 후 없으면 포맷 (ext4)
-FSTYPE="$(lsblk -no FSTYPE "${DEV}" | head -n1 || true)"
+FSTYPE="$(lsblk -no FSTYPE "${ACTUAL_DEV}" | head -n1 || true)"
 if [ -z "${FSTYPE}" ]; then
-  echo "[WARN] No filesystem on ${DEV}. Formatting ext4..."
-  sudo mkfs.ext4 -F "${DEV}"
+  echo "[WARN] No filesystem on ${ACTUAL_DEV}. Formatting ext4..."
+  sudo mkfs.ext4 -F "${ACTUAL_DEV}"
 fi
 
-echo "[INFO] Mount ${DEV} -> ${MNT}"
-sudo mount "${DEV}" "${MNT}"
+echo "[INFO] Mount ${ACTUAL_DEV} -> ${MNT}"
+sudo mount "${ACTUAL_DEV}" "${MNT}"
 
 # 권한 조정 (현재 사용자에게 쓰기 권한 부여)
 echo "[INFO] Chown ${MNT} to user..."
@@ -88,4 +97,4 @@ if [ -f "./wiki_corpus.txt" ]; then
   cp -f ./wiki_corpus.txt "${MNT}/"
 fi
 
-echo "[SUCCESS] Connected + mounted: ${DEV} -> ${MNT}"
+echo "[SUCCESS] Connected + mounted: ${ACTUAL_DEV} -> ${MNT}"

@@ -3,17 +3,27 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <sys/ipc.h>
 
 constexpr key_t SHM_READ_KEY = 0x1000;
 constexpr key_t SHM_WRITE_KEY = 0x1200;
-constexpr key_t MSG_KEY = 1002;
-constexpr std::size_t SHM_SIZE = 131072; // 128 KiB
+constexpr key_t SHM_READ_KEY_BANK1 = 0x1400;
+constexpr key_t SHM_WRITE_KEY_BANK1 = 0x1600;
+constexpr std::size_t SHM_SIZE = 131072; // 128 KiB per bank
 constexpr std::size_t NUM_SLOTS = 64;
+constexpr std::size_t NUM_BUFFERS = 2;
+
 constexpr key_t STATS_SHM_KEY = 0x2000;
 constexpr std::size_t STATS_SHM_SIZE = 4096;
+constexpr key_t IPC_CONFIG_SHM_KEY = 0x2100;
+constexpr std::size_t IPC_CONFIG_SHM_SIZE = 256;
+constexpr key_t IPC_STATE_SHM_KEY = 0x2200;
+constexpr std::size_t IPC_STATE_SHM_SIZE = 4096;
+inline constexpr const char* EVENTFD_SOCKET_PATH = "/var/tmp/ndt_bpe_eventfd.sock";
+constexpr std::uint32_t BPE_OUTPUT_ERROR = 0xFFFFFFFFU;
 
 struct BpeRuntimeStats {
     std::uint64_t magic = 0;
@@ -38,37 +48,97 @@ struct BpeRuntimeStats {
     std::array<std::uint64_t, NUM_SLOTS> per_slot_bytes_out{};
 };
 
-struct __attribute__((packed)) bpe_msg_req {
-    long msg_type;      // == 1
-    std::uint32_t total_len;
-    std::uint64_t req_id;
-    std::uint32_t slot; // cdw13
+static_assert(sizeof(BpeRuntimeStats) <= STATS_SHM_SIZE,
+              "BpeRuntimeStats no longer fits in the stats shared memory segment");
+
+struct bpe_msg_req {
+    std::uint32_t total_len = 0;
+    std::uint64_t req_id = 0;
+    std::uint32_t slot = 0;
 };
 
-struct __attribute__((packed)) bpe_msg_resp {
-    long msg_type; // == 2
-    std::uint32_t byte_size;
-    std::uint64_t req_id;
-    std::uint32_t slot;
+struct BpeRuntimeIpcConfig {
+    std::uint64_t magic = 0;
+    std::uint32_t version = 1;
+    std::uint32_t request_workers = 1;
+    std::uint32_t exec_mode = 0;
+    std::uint32_t reserved = 0;
 };
 
-enum {
-    BPE_REQ_MSZ = static_cast<int>(sizeof(bpe_msg_req) - sizeof(long)),
-    BPE_RESP_MSZ = static_cast<int>(sizeof(bpe_msg_resp) - sizeof(long)),
+static_assert(sizeof(BpeRuntimeIpcConfig) <= IPC_CONFIG_SHM_SIZE,
+              "BpeRuntimeIpcConfig no longer fits in the config shared memory segment");
+
+enum class BpeBufferState : std::uint32_t {
+    kFree = 0,
+    kWriting = 1,
+    kReady = 2,
+    kProcessing = 3,
+    kDone = 4,
+};
+
+struct BpeSlotBufferState {
+    std::uint64_t req_id = 0;
+    std::uint32_t input_len = 0;
+    std::uint32_t output_len = 0;
+    std::uint32_t state = static_cast<std::uint32_t>(BpeBufferState::kFree);
+    std::uint32_t reserved = 0;
+};
+
+struct BpeRuntimeSlotState {
+    std::array<BpeSlotBufferState, NUM_BUFFERS> buffers{};
+};
+
+struct BpeRuntimeIpcState {
+    std::uint64_t magic = 0;
+    std::uint32_t version = 1;
+    std::uint32_t reserved = 0;
+    std::array<BpeRuntimeSlotState, NUM_SLOTS> slots{};
+};
+
+static_assert(sizeof(BpeRuntimeIpcState) <= IPC_STATE_SHM_SIZE,
+              "BpeRuntimeIpcState no longer fits in the state shared memory segment");
+
+enum class InputMode : std::uint32_t {
+    kText = 0,
+    kArrow = 1,
+};
+
+enum class ExecMode : std::uint32_t {
+    kInline = 0,
+    kThread = 1,
+    kProcess = 2,
+};
+
+// Arrow mode does not receive a full Arrow IPC/file payload.
+// It receives bytes from the Arrow text values buffer path described by
+// `compute/src/extent-index.cpp`. Optional framing allows the producer to
+// identify the valid subrange inside an aligned storage chunk.
+struct __attribute__((packed)) ArrowChunkHeader {
+    std::uint32_t magic = 0x41525458U; // "ARTX"
+    std::uint16_t version = 1;
+    std::uint16_t reserved = 0;
+    std::uint32_t payload_offset = 0;
+    std::uint32_t payload_length = 0;
+    std::uint64_t data_range_offset = 0;
+    std::int64_t batch_index = -1;
+    std::int64_t num_rows = -1;
 };
 
 class ShmSlotWorker {
 public:
-    ShmSlotWorker() = default;
-    ShmSlotWorker(std::uint32_t slot, char* read_ptr, char* write_ptr);
+    using BankPtrs = std::array<char*, NUM_BUFFERS>;
 
-    std::uint32_t Process(std::uint32_t input_len) const;
+    ShmSlotWorker() = default;
+    ShmSlotWorker(std::uint32_t slot, BankPtrs read_ptrs, BankPtrs write_ptrs, InputMode mode);
+
+    std::uint32_t Process(std::size_t bank_index, std::uint32_t input_len) const;
     std::uint32_t slot() const { return slot_; }
 
 private:
     std::uint32_t slot_ = 0;
-    char* read_ptr_ = nullptr;
-    char* write_ptr_ = nullptr;
+    BankPtrs read_ptrs_{};
+    BankPtrs write_ptrs_{};
+    InputMode mode_ = InputMode::kText;
 };
 
 class SharedMemorySlots {
@@ -79,26 +149,29 @@ public:
     SharedMemorySlots(const SharedMemorySlots&) = delete;
     SharedMemorySlots& operator=(const SharedMemorySlots&) = delete;
 
-    std::vector<ShmSlotWorker> CreateWorkers() const;
+    std::vector<ShmSlotWorker> CreateWorkers(InputMode mode) const;
+    std::vector<ShmSlotWorker> CreateWorkers() const { return CreateWorkers(InputMode::kText); }
 
 private:
-    std::array<int, NUM_SLOTS> read_ids_{};
-    std::array<int, NUM_SLOTS> write_ids_{};
-    std::array<char*, NUM_SLOTS> read_ptrs_{};
-    std::array<char*, NUM_SLOTS> write_ptrs_{};
+    std::array<std::array<int, NUM_BUFFERS>, NUM_SLOTS> read_ids_{};
+    std::array<std::array<int, NUM_BUFFERS>, NUM_SLOTS> write_ids_{};
+    std::array<std::array<char*, NUM_BUFFERS>, NUM_SLOTS> read_ptrs_{};
+    std::array<std::array<char*, NUM_BUFFERS>, NUM_SLOTS> write_ptrs_{};
 };
 
 class MessageQueueDispatcher {
 public:
-    MessageQueueDispatcher(int msg_id, std::vector<ShmSlotWorker> workers);
+    struct Options {
+        ExecMode exec_mode = ExecMode::kInline;
+        std::size_t workers = 0;
+    };
 
-    static int OpenQueue(key_t key = MSG_KEY, int flags = IPC_CREAT | 0660);
+    explicit MessageQueueDispatcher(std::vector<ShmSlotWorker> workers);
+    MessageQueueDispatcher(std::vector<ShmSlotWorker> workers, Options options);
+
     void Run() const;
 
 private:
-    bool Receive(bpe_msg_req& req) const;
-    void Send(const bpe_msg_resp& resp) const;
-
-    int msg_id_ = -1;
     std::vector<ShmSlotWorker> workers_;
+    Options options_{};
 };

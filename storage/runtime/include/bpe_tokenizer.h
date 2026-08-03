@@ -18,6 +18,7 @@ public:
     BPETokenizer& operator=(const BPETokenizer&) = delete;
 
     // 토큰화 수행
+    std::vector<std::int32_t> Tokenize(const std::string& text);
     std::vector<std::int32_t> Tokenize(std::string_view text);
 
     // 경로 초기화 (Instance 호출 전에만 유효)

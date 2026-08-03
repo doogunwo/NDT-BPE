@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -44,10 +45,16 @@ public:
     // fiemap으로 산출된 세그먼트를 설정
     void set_metadata_segments(std::vector<NvmeSeg> segs);
 
+    void set_metadata_file_path(std::string path);
+    const std::string& metadata_file_path() const noexcept;
+
+    void store_blob(const void* data, std::size_t len, bool zero = true);
+    std::vector<std::uint8_t> load_blob_copy() const;
+
 private:
     int metadata_fd_ = -1; // 파일 디스크립터
     void* metadata_ptr_ = nullptr; // fallocate로 할당한 메타데이터 영역 포인터
     std::size_t metadata_size_ = 0; // 할당된 메타데이터 영역 크기
     std::vector<NvmeSeg> metadata_segs_; // 메타데이터 영역의 NvmeSeg 배열
-    const std::string metadata_file_path_ = "metadata_area.dat";
+    std::string metadata_file_path_ = "metadata_area.dat";
 };

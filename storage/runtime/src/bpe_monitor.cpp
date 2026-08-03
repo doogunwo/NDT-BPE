@@ -22,6 +22,7 @@
 namespace {
 
 constexpr std::uint64_t kStatsMagic = 0x4250455354415431ULL; // "BPESTAT1"
+constexpr std::uint64_t kIpcStateMagic = 0x4250455354415445ULL; // "BPESTATE"
 
 volatile std::sig_atomic_t g_stop = 0;
 
@@ -207,6 +208,65 @@ double jains_fairness_index(const std::vector<double>& values) {
     return (sum * sum) / (static_cast<double>(values.size()) * sq_sum);
 }
 
+struct SlotIpcStateCounts {
+    std::uint32_t writing = 0;
+    std::uint32_t ready = 0;
+    std::uint32_t processing = 0;
+    std::uint32_t done = 0;
+
+    std::uint32_t outstanding() const {
+        return writing + ready + processing + done;
+    }
+};
+
+struct IpcStateSnapshot {
+    bool valid = false;
+    std::uint64_t writing = 0;
+    std::uint64_t ready = 0;
+    std::uint64_t processing = 0;
+    std::uint64_t done = 0;
+    std::uint64_t outstanding = 0;
+    std::array<SlotIpcStateCounts, NUM_SLOTS> per_slot{};
+};
+
+IpcStateSnapshot snapshot_ipc_state(const BpeRuntimeIpcState* ipc_state) {
+    IpcStateSnapshot snapshot{};
+    if (ipc_state == nullptr || load_u64(&ipc_state->magic) != kIpcStateMagic) {
+        return snapshot;
+    }
+
+    snapshot.valid = true;
+    for (std::size_t slot = 0; slot < NUM_SLOTS; ++slot) {
+        for (std::size_t bank = 0; bank < NUM_BUFFERS; ++bank) {
+            const auto state = static_cast<BpeBufferState>(
+                load_u32(&ipc_state->slots[slot].buffers[bank].state));
+            switch (state) {
+            case BpeBufferState::kFree:
+                break;
+            case BpeBufferState::kWriting:
+                ++snapshot.writing;
+                ++snapshot.per_slot[slot].writing;
+                break;
+            case BpeBufferState::kReady:
+                ++snapshot.ready;
+                ++snapshot.per_slot[slot].ready;
+                break;
+            case BpeBufferState::kProcessing:
+                ++snapshot.processing;
+                ++snapshot.per_slot[slot].processing;
+                break;
+            case BpeBufferState::kDone:
+                ++snapshot.done;
+                ++snapshot.per_slot[slot].done;
+                break;
+            }
+        }
+    }
+
+    snapshot.outstanding = snapshot.writing + snapshot.ready + snapshot.processing + snapshot.done;
+    return snapshot;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -256,6 +316,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    BpeRuntimeIpcState* ipc_state = nullptr;
+    const int ipc_state_id = shmget(IPC_STATE_SHM_KEY, IPC_STATE_SHM_SIZE, 0660);
+    if (ipc_state_id >= 0) {
+        void* ipc_ptr = shmat(ipc_state_id, nullptr, SHM_RDONLY);
+        if (ipc_ptr == reinterpret_cast<void*>(-1)) {
+            std::perror("[BPE-MON] state shmat");
+        } else {
+            ipc_state = reinterpret_cast<BpeRuntimeIpcState*>(ipc_ptr);
+        }
+    }
+
     std::signal(SIGINT, handle_sigint);
     std::signal(SIGTERM, handle_sigint);
 
@@ -282,6 +353,7 @@ int main(int argc, char** argv) {
         }
         csv << "ts_us,req_total,resp_total,outstanding,last_latency_us,"
                "req_per_s,resp_per_s,in_MBps,out_MBps,fairness_resp,"
+               "ipc_outstanding,ipc_writing,ipc_ready,ipc_processing,ipc_done,"
                "cpu_busy_all,net_rx_MBps,net_tx_MBps,net_rx_drop_delta,net_tx_drop_delta,"
                "blk_read_MBps,blk_write_MBps,blk_util_pct,blk_in_flight\n";
     }
@@ -301,7 +373,9 @@ int main(int argc, char** argv) {
         const std::uint64_t last_req_id = load_u64(&stats->last_req_id);
         const std::uint32_t last_slot = load_u32(&stats->last_slot);
         const std::uint32_t last_resp_bytes = load_u32(&stats->last_resp_bytes);
-        const std::uint64_t outstanding = (req_total >= resp_total) ? (req_total - resp_total) : 0;
+        const std::uint64_t counter_outstanding = (req_total >= resp_total) ? (req_total - resp_total) : 0;
+        const IpcStateSnapshot ipc_snapshot = snapshot_ipc_state(ipc_state);
+        const std::uint64_t outstanding = ipc_snapshot.valid ? ipc_snapshot.outstanding : counter_outstanding;
 
         const double delta_req = static_cast<double>(req_total - prev_req) * 1000.0 / interval_ms;
         const double delta_resp = static_cast<double>(resp_total - prev_resp) * 1000.0 / interval_ms;
@@ -361,6 +435,16 @@ int main(int argc, char** argv) {
         std::printf("TS       start_us=%" PRIu64 " last_us=%" PRIu64 "\n",
                     start_ts, last_ts);
         std::printf("Fairness resp_jain=%.3f\n", fairness_resp);
+        if (ipc_snapshot.valid) {
+            std::printf("IPC      live=%" PRIu64 " writing=%" PRIu64 " ready=%" PRIu64
+                        " processing=%" PRIu64 " done=%" PRIu64 " counter=%" PRIu64 "\n",
+                        ipc_snapshot.outstanding,
+                        ipc_snapshot.writing,
+                        ipc_snapshot.ready,
+                        ipc_snapshot.processing,
+                        ipc_snapshot.done,
+                        counter_outstanding);
+        }
         if (have_cpu && !cpu_cores.empty()) {
             std::printf("CPU      ");
             for (std::size_t i = 0; i < cpu_cores.size(); ++i) {
@@ -394,16 +478,27 @@ int main(int argc, char** argv) {
             const std::uint64_t s_resp = load_u64(&stats->per_slot_resp[s]);
             const std::uint64_t s_in = load_u64(&stats->per_slot_bytes_in[s]);
             const std::uint64_t s_out = load_u64(&stats->per_slot_bytes_out[s]);
-            const std::uint64_t s_outstanding = (s_req >= s_resp) ? (s_req - s_resp) : 0;
+            const std::uint64_t s_counter_outstanding = (s_req >= s_resp) ? (s_req - s_resp) : 0;
+            const std::uint64_t s_outstanding =
+                ipc_snapshot.valid ? ipc_snapshot.per_slot[s].outstanding() : s_counter_outstanding;
             const double s_resp_rate =
                 static_cast<double>(cur_slot_resp[s] - prev_slot_resp[s]) * 1000.0 / interval_ms;
-            if (s_req == 0 && s_resp == 0) {
+            if (s_req == 0 && s_resp == 0 && s_outstanding == 0) {
                 continue;
             }
-            std::printf("  slot %2zu: req=%" PRIu64 " resp=%" PRIu64 " outstd=%" PRIu64
-                        " resp/s=%.1f in=%.2fMB out=%.2fMB\n",
-                        s, s_req, s_resp, s_outstanding, s_resp_rate,
-                        bytes_to_mb(s_in), bytes_to_mb(s_out));
+            if (ipc_snapshot.valid) {
+                const auto& slot_ipc = ipc_snapshot.per_slot[s];
+                std::printf("  slot %2zu: req=%" PRIu64 " resp=%" PRIu64 " outstd=%" PRIu64
+                            " resp/s=%.1f ipc[w/r/p/d]=%u/%u/%u/%u in=%.2fMB out=%.2fMB\n",
+                            s, s_req, s_resp, s_outstanding, s_resp_rate,
+                            slot_ipc.writing, slot_ipc.ready, slot_ipc.processing, slot_ipc.done,
+                            bytes_to_mb(s_in), bytes_to_mb(s_out));
+            } else {
+                std::printf("  slot %2zu: req=%" PRIu64 " resp=%" PRIu64 " outstd=%" PRIu64
+                            " resp/s=%.1f in=%.2fMB out=%.2fMB\n",
+                            s, s_req, s_resp, s_outstanding, s_resp_rate,
+                            bytes_to_mb(s_in), bytes_to_mb(s_out));
+            }
         }
         std::fflush(stdout);
 
@@ -418,6 +513,11 @@ int main(int argc, char** argv) {
                 << "," << delta_in_mb
                 << "," << delta_out_mb
                 << "," << fairness_resp
+                << "," << ipc_snapshot.outstanding
+                << "," << ipc_snapshot.writing
+                << "," << ipc_snapshot.ready
+                << "," << ipc_snapshot.processing
+                << "," << ipc_snapshot.done
                 << "," << cpu_busy_all
                 << "," << net_rx_mb
                 << "," << net_tx_mb

@@ -1,6 +1,8 @@
 # 컴파일러 설정
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Iinclude -lpthread -ldl -lrt -g
+OPTFLAGS ?= -O3 -DNDEBUG
+DBGFLAGS ?= -g
+CXXFLAGS = -std=c++17 -Wall -Wextra -Iinclude -lpthread -ldl -lrt $(OPTFLAGS) $(DBGFLAGS)
 
 # 라이브러리 디렉토리 설정 (NDT-BPE 내부 토크나이저 의존)
 TOKENIZERS_DIR = ../../compute/third_party/tokenizers-cpp
@@ -49,5 +51,13 @@ clean:
 
 # 공유 메모리 삭제 (디버깅을 위한 추가 명령어)
 clean_shm:
-	ipcrm -M 5678
-	ipcrm -M 5679
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1000)) $$((0x103f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1200)) $$((0x123f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1400)) $$((0x143f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@for key in $$(printf "0x%x\n" $$(seq $$((0x1600)) $$((0x163f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@ipcrm -M 0x2000 2>/dev/null || true
+	@ipcrm -M 0x2100 2>/dev/null || true
+	@ipcrm -M 0x2200 2>/dev/null || true
+	@ipcrm -Q 1002 2>/dev/null || true
+	@ipcrm -Q 1003 2>/dev/null || true
+	@rm -f /var/tmp/ndt_bpe_eventfd.sock

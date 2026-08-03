@@ -54,6 +54,7 @@ struct Options {
     unsigned queue_depth = kDefaultQueueDepth;
     std::size_t max_inflight = 0;
     std::size_t slots = 5;
+    int fixed_slot = -1;
     std::size_t max_blocks_per_seg = FIEMAP_MDTS_BLOCKS;
     std::size_t max_extents = FIEMAP_MAX_EXTENTS;
     bool admin = false;
@@ -70,6 +71,7 @@ void print_usage(const char* prog) {
         << "  --queue-depth <n>          io_uring queue depth (default 256)\n"
         << "  --max-inflight <n>         Max in-flight commands (default slots)\n"
         << "  --slots <n>                Slot count for cdw13 round-robin (default 5)\n"
+        << "  --fixed-slot <n>           Use only one slot id (requires max-inflight=1)\n"
         << "  --out-file <path>          Output file path (default: <file_path>.bin)\n"
         << "  --max-blocks-per-seg <n>   Split segments by N blocks (default 256)\n"
         << "  --max-extents <n>          Max FIEMAP extents (default 128)\n"
@@ -138,6 +140,13 @@ bool parse_args(int argc, char** argv, Options& opt) {
                 return false;
             }
             opt.slots = static_cast<std::size_t>(v);
+        } else if (arg == "--fixed-slot" && i + 1 < argc) {
+            std::uint64_t v = 0;
+            if (!parse_u64(argv[++i], v)) {
+                std::cerr << "Invalid fixed-slot\n";
+                return false;
+            }
+            opt.fixed_slot = static_cast<int>(v);
         } else if (arg == "--out-file" && i + 1 < argc) {
             opt.out_path = argv[++i];
         } else if (arg == "--max-blocks-per-seg" && i + 1 < argc) {
@@ -179,6 +188,16 @@ bool parse_args(int argc, char** argv, Options& opt) {
     }
     if (!opt.max_inflight_set) {
         opt.max_inflight = opt.slots;
+    }
+    if (opt.fixed_slot >= 0) {
+        if (opt.slots == 0 || static_cast<std::size_t>(opt.fixed_slot) >= opt.slots) {
+            std::cerr << "fixed-slot must be smaller than slots\n";
+            return false;
+        }
+        if (opt.max_inflight != 1) {
+            std::cerr << "fixed-slot requires max-inflight=1\n";
+            return false;
+        }
     }
     if (opt.out_path.empty()) {
         opt.out_path = opt.file_path + ".bin";
@@ -253,12 +272,58 @@ bool ensure_output_file(const std::string& path, std::size_t size_bytes) {
         return false;
     }
     if (size_bytes > 0) {
-        const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(size_bytes));
-        if (rc != 0) {
-            std::cerr << "posix_fallocate(" << path << ") failed: " << std::strerror(rc) << "\n";
+        if (::ftruncate(fd, static_cast<off_t>(size_bytes)) != 0) {
+            std::cerr << "ftruncate(" << path << ") failed: " << std::strerror(errno) << "\n";
             ::close(fd);
             return false;
         }
+
+        std::vector<char> zeros(1U << 20, 0);
+        std::size_t written = 0;
+        while (written < size_bytes) {
+            const std::size_t chunk = std::min<std::size_t>(zeros.size(), size_bytes - written);
+            const ssize_t rc = ::pwrite(fd,
+                                        zeros.data(),
+                                        chunk,
+                                        static_cast<off_t>(written));
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::cerr << "pwrite(" << path << ") failed: " << std::strerror(errno) << "\n";
+                ::close(fd);
+                return false;
+            }
+            written += static_cast<std::size_t>(rc);
+        }
+
+        if (::fsync(fd) != 0) {
+            std::cerr << "fsync(" << path << ") failed: " << std::strerror(errno) << "\n";
+            ::close(fd);
+            return false;
+        }
+    }
+    ::close(fd);
+    return true;
+}
+
+
+
+bool drop_file_cache(const std::string& path, std::size_t size_bytes, std::string* err = nullptr) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (err) {
+            *err = std::string("open(cache-drop) failed: ") + std::strerror(errno);
+        }
+        return false;
+    }
+    const int rc = ::posix_fadvise(fd, 0, static_cast<off_t>(size_bytes), POSIX_FADV_DONTNEED);
+    if (rc != 0) {
+        if (err) {
+            *err = std::string("posix_fadvise(DONTNEED) failed: ") + std::strerror(rc);
+        }
+        ::close(fd);
+        return false;
     }
     ::close(fd);
     return true;
@@ -405,9 +470,14 @@ int main(int argc, char** argv) {
             return -ENOMEM;
         }
 
-        const std::uint32_t slot = static_cast<std::uint32_t>(
-            opt.slots == 0 ? 0 : (slot_rr % opt.slots));
-        ++slot_rr;
+        std::uint32_t slot = 0;
+        if (opt.fixed_slot >= 0) {
+            slot = static_cast<std::uint32_t>(opt.fixed_slot);
+        } else {
+            slot = static_cast<std::uint32_t>(
+                opt.slots == 0 ? 0 : (slot_rr % opt.slots));
+            ++slot_rr;
+        }
 
         nvme_uring_cmd uc{};
         fill_nvme_cmd(opt.opcode, opt.nsid, job.in_slba, job.nblocks, slot, job.out_slba,
@@ -467,7 +537,7 @@ int main(int argc, char** argv) {
 
         const auto pending_it = pending.find(cqe->user_data);
 
-        if (cqe->res < 0 || cqe_res2 != 0 || nvme_status_err) {
+        if (cqe->res != 0 || cqe_res2 != 0 || nvme_status_err) {
             ++errors;
             if (!opt.quiet) {
                 std::uint64_t slba = 0;
@@ -557,6 +627,11 @@ int main(int argc, char** argv) {
             ::close(dev_fd);
             return 1;
         }
+    }
+
+    std::string cache_drop_err;
+    if (!drop_file_cache(opt.out_path, total_bytes, &cache_drop_err) && !opt.quiet) {
+        std::cerr << "[WARN] " << cache_drop_err << "\n";
     }
 
     const double t1 = now_us();

@@ -1,8 +1,8 @@
 import ndt_compute
 
 stats = ndt_compute.arrow_text_dump(
-    input_path="data/dataset.arrow",
-    output_path="data/extracted_text.txt",
+    input_path="/mnt/nvme/openwebtext_disk/data-00000-of-00080.arrow",
+    output_path="/mnt/nvme/openwebtext_bin/data-00000-of-00080.bin",
     column="text",
     delimiter="\n",
     max_rows=10000

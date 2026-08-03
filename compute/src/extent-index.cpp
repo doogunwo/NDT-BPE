@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <system_error>
@@ -17,6 +18,9 @@
 #include <unistd.h>
 
 namespace {
+
+constexpr std::uint32_t kExtentIndexMagic = 0x58444945U; // "EIDX"
+constexpr std::uint32_t kExtentIndexVersion = 1;
 
 struct FileExtent {
     std::uint64_t logical = 0;
@@ -230,6 +234,51 @@ bool string_array_value_range(const std::shared_ptr<arrow::Array>& array,
     return false;
 }
 
+template <typename T>
+void append_pod(std::vector<std::uint8_t>& out, const T& value) {
+    const auto* ptr = reinterpret_cast<const std::uint8_t*>(&value);
+    out.insert(out.end(), ptr, ptr + sizeof(T));
+}
+
+void append_string(std::vector<std::uint8_t>& out, const std::string& value) {
+    const auto len = static_cast<std::uint64_t>(value.size());
+    append_pod(out, len);
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+template <typename T>
+bool read_pod(const std::uint8_t*& cur,
+              const std::uint8_t* end,
+              T* out,
+              std::string* error,
+              const char* label) {
+    if (static_cast<std::size_t>(end - cur) < sizeof(T)) {
+        set_error(error, std::string("extent-index deserialize truncated at ") + label);
+        return false;
+    }
+    std::memcpy(out, cur, sizeof(T));
+    cur += sizeof(T);
+    return true;
+}
+
+bool read_string(const std::uint8_t*& cur,
+                 const std::uint8_t* end,
+                 std::string* out,
+                 std::string* error,
+                 const char* label) {
+    std::uint64_t len = 0;
+    if (!read_pod(cur, end, &len, error, label)) {
+        return false;
+    }
+    if (static_cast<std::uint64_t>(end - cur) < len) {
+        set_error(error, std::string("extent-index deserialize truncated string at ") + label);
+        return false;
+    }
+    out->assign(reinterpret_cast<const char*>(cur), static_cast<std::size_t>(len));
+    cur += len;
+    return true;
+}
+
 } // namespace
 
 bool BuildArrowTextExtentIndex(const std::string& arrow_path,
@@ -372,5 +421,111 @@ bool BuildArrowTextExtentIndex(const std::string& arrow_path,
         }
     }
 
+    return true;
+}
+
+bool SerializeExtentIndexBinary(const ExtentIndex& index,
+                                std::vector<std::uint8_t>* out_bytes,
+                                std::string* error) {
+    if (!out_bytes) {
+        set_error(error, "out_bytes is null");
+        return false;
+    }
+
+    out_bytes->clear();
+    append_pod(*out_bytes, kExtentIndexMagic);
+    append_pod(*out_bytes, kExtentIndexVersion);
+    append_string(*out_bytes, index.arrow_path);
+    append_string(*out_bytes, index.column);
+
+    const auto buffer_count = static_cast<std::uint64_t>(index.buffers.size());
+    append_pod(*out_bytes, buffer_count);
+
+    for (const auto& buf : index.buffers) {
+        append_pod(*out_bytes, buf.batch_index);
+        append_pod(*out_bytes, buf.num_rows);
+        append_pod(*out_bytes, buf.data_range.offset);
+        append_pod(*out_bytes, buf.data_range.length);
+        const auto extent_count = static_cast<std::uint64_t>(buf.lba_extents.size());
+        append_pod(*out_bytes, extent_count);
+        for (const auto& ext : buf.lba_extents) {
+            append_pod(*out_bytes, ext.slba);
+            append_pod(*out_bytes, ext.nblocks);
+        }
+    }
+    return true;
+}
+
+bool DeserializeExtentIndexBinary(const void* data,
+                                  std::size_t size,
+                                  ExtentIndex* out_index,
+                                  std::string* error) {
+    if (data == nullptr || out_index == nullptr) {
+        set_error(error, "DeserializeExtentIndexBinary invalid arguments");
+        return false;
+    }
+
+    const auto* cur = static_cast<const std::uint8_t*>(data);
+    const auto* end = cur + size;
+
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    if (!read_pod(cur, end, &magic, error, "magic") ||
+        !read_pod(cur, end, &version, error, "version")) {
+        return false;
+    }
+    if (magic != kExtentIndexMagic) {
+        set_error(error, "extent-index deserialize magic mismatch");
+        return false;
+    }
+    if (version != kExtentIndexVersion) {
+        set_error(error, "extent-index deserialize version mismatch");
+        return false;
+    }
+
+    ExtentIndex index;
+    if (!read_string(cur, end, &index.arrow_path, error, "arrow_path") ||
+        !read_string(cur, end, &index.column, error, "column")) {
+        return false;
+    }
+
+    std::uint64_t buffer_count = 0;
+    if (!read_pod(cur, end, &buffer_count, error, "buffer_count")) {
+        return false;
+    }
+    index.buffers.clear();
+    index.buffers.reserve(static_cast<std::size_t>(buffer_count));
+
+    for (std::uint64_t i = 0; i < buffer_count; ++i) {
+        TextBufferExtent buf{};
+        if (!read_pod(cur, end, &buf.batch_index, error, "batch_index") ||
+            !read_pod(cur, end, &buf.num_rows, error, "num_rows") ||
+            !read_pod(cur, end, &buf.data_range.offset, error, "data_range.offset") ||
+            !read_pod(cur, end, &buf.data_range.length, error, "data_range.length")) {
+            return false;
+        }
+        std::uint64_t extent_count = 0;
+        if (!read_pod(cur, end, &extent_count, error, "extent_count")) {
+            return false;
+        }
+        buf.lba_extents.clear();
+        buf.lba_extents.reserve(static_cast<std::size_t>(extent_count));
+        for (std::uint64_t j = 0; j < extent_count; ++j) {
+            LbaExtent ext{};
+            if (!read_pod(cur, end, &ext.slba, error, "slba") ||
+                !read_pod(cur, end, &ext.nblocks, error, "nblocks")) {
+                return false;
+            }
+            buf.lba_extents.push_back(ext);
+        }
+        index.buffers.push_back(std::move(buf));
+    }
+
+    if (cur != end) {
+        set_error(error, "extent-index deserialize trailing bytes");
+        return false;
+    }
+
+    *out_index = std::move(index);
     return true;
 }

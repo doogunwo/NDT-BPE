@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -40,3 +42,12 @@ bool BuildArrowTextExtentIndex(const std::string& arrow_path,
                                const ExtentIndexOptions& options,
                                ExtentIndex* out_index,
                                std::string* error);
+
+bool SerializeExtentIndexBinary(const ExtentIndex& index,
+                                std::vector<std::uint8_t>* out_bytes,
+                                std::string* error);
+
+bool DeserializeExtentIndexBinary(const void* data,
+                                  std::size_t size,
+                                  ExtentIndex* out_index,
+                                  std::string* error);

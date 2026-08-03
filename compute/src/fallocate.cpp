@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
@@ -9,6 +10,7 @@
 #include <utility>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 namespace {
 
@@ -206,9 +208,47 @@ void ffilesystem::load_metadata() {
     if (metadata_ptr_ != nullptr) {
         return;
     }
-    allocate_metadata(false);
+    struct stat st {};
+    if (::stat(metadata_file_path_.c_str(), &st) != 0) {
+        if (errno == ENOENT) {
+            allocate_metadata(false);
+            return;
+        }
+        throw std::system_error(errno, std::generic_category(), "stat metadata file failed");
+    }
+    advocate_metadata(static_cast<std::size_t>(st.st_size), false);
 }
 
 void ffilesystem::set_metadata_segments(std::vector<NvmeSeg> segs) {
     metadata_segs_ = std::move(segs);
+}
+
+void ffilesystem::set_metadata_file_path(std::string path) {
+    if (metadata_ptr_ != nullptr || metadata_fd_ >= 0) {
+        throw std::logic_error("cannot change metadata file path while metadata is loaded");
+    }
+    metadata_file_path_ = std::move(path);
+}
+
+const std::string& ffilesystem::metadata_file_path() const noexcept {
+    return metadata_file_path_;
+}
+
+void ffilesystem::store_blob(const void* data, std::size_t len, bool zero) {
+    if (data == nullptr && len != 0) {
+        throw std::invalid_argument("store_blob data is null");
+    }
+    advocate_metadata(len, zero);
+    if (len != 0) {
+        std::memcpy(metadata_ptr_, data, len);
+    }
+    flush_metadata();
+}
+
+std::vector<std::uint8_t> ffilesystem::load_blob_copy() const {
+    if (metadata_ptr_ == nullptr) {
+        throw std::logic_error("metadata is not allocated");
+    }
+    const auto* begin = static_cast<const std::uint8_t*>(metadata_ptr_);
+    return std::vector<std::uint8_t>(begin, begin + metadata_size_);
 }

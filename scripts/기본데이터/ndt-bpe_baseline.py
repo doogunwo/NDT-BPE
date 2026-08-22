@@ -21,11 +21,41 @@ from tokenizers import Tokenizer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = SCRIPT_DIR.parent / "storage" / "runtime" / "model" / "bbpe_tokenizer.json"
-DEFAULT_INPUT_DIR = Path("/mnt/nvme/openwebtext_disk")
+DEFAULT_INPUT_DIR = Path("/mnt/nvme/openwebtext_for_ndt")
 DEFAULT_OUTPUT_DIR = Path("/mnt/nvme/openweb_bin")
 DEFAULT_STATS_DIR = SCRIPT_DIR / "baseline_logs"
 
 TOKENIZER: Optional[Tokenizer] = None
+
+
+def texts_from_arrow_array(arr: pa.Array) -> List[str]:
+    if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
+        try:
+            return [text for text in arr.to_pylist() if text]
+        except UnicodeDecodeError:
+            offsets_buf = arr.buffers()[1]
+            data_buf = arr.buffers()[2]
+            if offsets_buf is None or data_buf is None:
+                return []
+            offset_width = 8 if pa.types.is_large_string(arr.type) else 4
+            fmt_char = "q" if offset_width == 8 else "i"
+            values_count = len(arr) + 1
+            start = arr.offset * offset_width
+            stop = start + values_count * offset_width
+            raw_offsets = offsets_buf.to_pybytes()[start:stop]
+            offsets = list(struct.unpack(f"<{values_count}{fmt_char}", raw_offsets))
+            data = data_buf.to_pybytes()
+            texts: List[str] = []
+            for i in range(len(offsets) - 1):
+                if not arr[i].is_valid:
+                    continue
+                start = offsets[i]
+                end = offsets[i + 1]
+                text = data[start:end].decode("utf-8", errors="ignore")
+                if text:
+                    texts.append(text)
+            return texts
+    return [text for text in arr.to_pylist() if text]
 
 
 def drop_linux_caches() -> None:
@@ -87,18 +117,18 @@ def process_arrow_file(input_path: Path, output_path: Path, column: str) -> Dict
     reader = None
     try:
         try:
-            reader = ipc.open_stream(mmap)
-            batches = reader
-        except Exception:
             reader = ipc.open_file(mmap)
             batches = (reader.get_batch(i) for i in range(reader.num_record_batches))
+        except Exception:
+            reader = ipc.open_stream(mmap)
+            batches = reader
 
         with output_path.open("wb") as f_out:
             for batch in batches:
                 if column not in batch.schema.names:
                     raise RuntimeError(f"column '{column}' not found in {input_path}")
                 arr = batch.column(batch.schema.get_field_index(column))
-                texts = [text for text in arr.to_pylist() if text]
+                texts = texts_from_arrow_array(arr)
                 total_tokens += encode_texts(texts, f_out)
             f_out.flush()
             os.fsync(f_out.fileno())

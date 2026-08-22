@@ -16,7 +16,7 @@ from tokenizers import Tokenizer
 prefix = "data-"
 suffix = "-of-00080.arrow"
 
-folder_path = "/mnt/nvme/openwebtext_disk"
+folder_path = "/mnt/nvme/openwebtext_for_ndt"
 write_path = "/mnt/nvme/bin"
 
 

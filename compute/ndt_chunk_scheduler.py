@@ -141,6 +141,8 @@ def process_chunk_file(
         "elapsed_s_wall": elapsed_s,
         "elapsed_s_device": float(result["elapsed_us"]) / 1_000_000.0,
         "output_bytes": Path(output_path).stat().st_size if Path(output_path).exists() else 0,
+        "output_valid_bytes": int(result.get("output_valid_bytes", 0)),
+        "tokens": int(result.get("tokens", 0)),
     }
 
 
@@ -172,6 +174,7 @@ def _tokenize_arrow_file_chunked(
     verbose: bool = False,
     temp_root: Optional[str] = None,
     keep_temp: bool = False,
+    no_merge: bool = False,
     executor: Optional[ProcessPoolExecutor] = None,
 ) -> Dict[str, object]:
     if slots < 1:
@@ -248,6 +251,8 @@ def _tokenize_arrow_file_chunked(
     total_segments = sum(int(row["segments"]) for row in rows)
     total_errors = sum(int(row["errors"]) for row in rows)
     total_elapsed_device = sum(float(row["elapsed_s_device"]) for row in rows)
+    total_output_valid_bytes = sum(int(row.get("output_valid_bytes", 0)) for row in rows)
+    total_tokens = sum(int(row.get("tokens", 0)) for row in rows)
     throughput_MBps = 0.0
     if elapsed_s > 0:
         throughput_MBps = (total_bytes / (1024.0 * 1024.0)) / elapsed_s
@@ -272,6 +277,8 @@ def _tokenize_arrow_file_chunked(
                 "device_elapsed_s_sum": total_elapsed_device,
                 "throughput_MBps": throughput_MBps,
                 "output_bytes": output_bytes,
+                "output_valid_bytes": total_output_valid_bytes,
+                "tokens": total_tokens,
                 "rows": rows,
                 "workspace": str(workspace),
                 "failed_chunks": [int(row["chunk_index"]) for row in failed_rows],
@@ -279,7 +286,10 @@ def _tokenize_arrow_file_chunked(
             }
             raise RuntimeError(json.dumps(summary, ensure_ascii=False))
 
-        output_bytes = merge_part_bins(rows, output_path_obj, cleanup_parts=not keep_temp)
+        if no_merge:
+            output_bytes = 0
+        else:
+            output_bytes = merge_part_bins(rows, output_path_obj, cleanup_parts=not keep_temp)
 
         summary = {
             "backend": "ndp_chunk_scheduler",
@@ -297,6 +307,9 @@ def _tokenize_arrow_file_chunked(
             "device_elapsed_s_sum": total_elapsed_device,
             "throughput_MBps": throughput_MBps,
             "output_bytes": output_bytes,
+            "output_valid_bytes": total_output_valid_bytes,
+            "tokens": total_tokens,
+            "merged": not no_merge,
             "rows": rows,
             "workspace": str(workspace),
         }
@@ -359,6 +372,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--temp-root", default=None)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument("--no-merge", action="store_true", help="skip final part-file merge and print summary only")
     args = parser.parse_args()
 
     summary = tokenize_arrow_file_chunked(
@@ -373,6 +387,7 @@ def main() -> None:
         verbose=args.verbose,
         temp_root=args.temp_root,
         keep_temp=args.keep_temp,
+        no_merge=args.no_merge,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

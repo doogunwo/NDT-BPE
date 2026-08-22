@@ -452,7 +452,7 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("/mnt/nvme/openwebtext_disk"),
+        default=Path("/mnt/nvme/openwebtext_for_ndt"),
         help="입력 디렉터리 경로.",
     )
     parser.add_argument(

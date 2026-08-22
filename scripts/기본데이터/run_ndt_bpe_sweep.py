@@ -542,7 +542,7 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("/mnt/nvme/openwebtext_disk"),
+        default=Path("/mnt/nvme/openwebtext_for_ndt"),
         help="Arrow 샤드가 있는 입력 디렉터리.",
     )
     parser.add_argument(

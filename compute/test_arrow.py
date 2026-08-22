@@ -1,7 +1,7 @@
 import ndt_compute
 
 stats = ndt_compute.arrow_text_dump(
-    input_path="/mnt/nvme/openwebtext_disk/data-00000-of-00080.arrow",
+    input_path="/mnt/nvme/openwebtext_for_ndt/data-00000-of-00080.arrow",
     output_path="/mnt/nvme/openwebtext_bin/data-00000-of-00080.bin",
     column="text",
     delimiter="\n",

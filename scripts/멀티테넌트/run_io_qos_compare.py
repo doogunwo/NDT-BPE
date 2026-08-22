@@ -277,7 +277,7 @@ def main() -> None:
     )
     parser.add_argument("--fio-job", type=Path, required=True, help="fio job 파일 경로")
     parser.add_argument("--fio-bin", default="fio", help="fio 실행 파일 경로")
-    parser.add_argument("--input-dir", type=Path, default=Path("/mnt/nvme/openwebtext_disk"))
+    parser.add_argument("--input-dir", type=Path, default=Path("/mnt/nvme/openwebtext_for_ndt"))
     parser.add_argument("--input-glob", default="*.arrow")
     parser.add_argument("--ndp-output-dir", type=Path, default=Path("/mnt/nvme/openweb_bin_ndp"))
     parser.add_argument("--dev-path", default="/dev/ng0n1")

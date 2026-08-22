@@ -13,6 +13,7 @@ constexpr std::size_t FIEMAP_MAX_EXTENTS = 128ULL;
 struct NvmeSeg {
     std::uint64_t slba = 0;    // start LBA (512B units)
     std::uint32_t nblocks = 0; // number of 512B blocks
+    std::uint32_t valid_bytes = 0; // valid payload bytes when this segment is a staged text payload
 };
 
 class fiemap_schedule {

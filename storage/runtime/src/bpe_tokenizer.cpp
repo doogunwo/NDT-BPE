@@ -1,8 +1,6 @@
 #include "bpe_tokenizer.h"
 
 #include "tokenizers_cpp.h"
-#include <nlohmann/json.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -17,11 +15,10 @@
 
 namespace Runtime::BPE {
 namespace fs = std::filesystem;
-using json = nlohmann::json;
 
 // 내부 전역 변수
 static std::atomic<long long> g_tokenize_total_us{0};
-static std::string g_model_path  = "./model/byte_level_bpe_model.json";
+static std::string g_model_path  = "./model/bbpe_tokenizer.json";
 static std::string g_merges_path = "./model/merges.txt";
 
 static std::string ResolveArtifactPath(const char* env_name,
@@ -67,17 +64,15 @@ static std::string LoadFileBinary(const std::string& path) {
 
 // Impl 정의
 struct BPETokenizer::Impl {
-    std::string merges_blob;
-    std::string vocab_blob;
-    std::string added_token;
+    std::string tokenizer_json;
 
     Impl(const std::string& model_path, const std::string& merges_path) {
         const std::string resolved_model = ResolveArtifactPath(
             "BPE_MODEL_PATH",
             model_path,
             {
-                "./model/byte_level_bpe_model.json",
-                "../model/byte_level_bpe_model.json",
+                "./model/bbpe_tokenizer.json",
+                "../model/bbpe_tokenizer.json",
             });
         const std::string resolved_merges = ResolveArtifactPath(
             "BPE_MERGES_PATH",
@@ -91,22 +86,18 @@ struct BPETokenizer::Impl {
             throw std::runtime_error("Model files not found: " + resolved_model + " or " + resolved_merges);
         }
 
-        merges_blob = LoadFileBinary(resolved_merges);
-        std::string json_blob = LoadFileBinary(resolved_model);
-
-        json j = json::parse(json_blob);
-        vocab_blob = j.at("model").at("vocab").dump();
-
-        added_token = R"({
-            "[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4
-        })";
+        // Load the exact Hugging Face tokenizer artifact. Reconstructing a
+        // ByteLevelBPE tokenizer from only vocab/merges silently discards
+        // normalizer, pre-tokenizer, decoder, added-token, and model options.
+        // That made the storage result differ from Tokenizer.from_file().
+        tokenizer_json = LoadFileBinary(resolved_model);
 
         auto tokenizer = CreateTokenizer();
         if (!tokenizer) throw std::runtime_error("Tokenizer init returned null");
     }
 
     std::unique_ptr<tokenizers::Tokenizer> CreateTokenizer() const {
-        return tokenizers::Tokenizer::FromBlobByteLevelBPE(vocab_blob, merges_blob, added_token);
+        return tokenizers::Tokenizer::FromBlobJSON(tokenizer_json);
     }
 };
 
@@ -150,6 +141,32 @@ std::vector<std::int32_t> BPETokenizer::Tokenize(std::string_view text) {
     thread_local std::string tls_text;
     tls_text.assign(text.data(), text.size());
     return Tokenize(tls_text);
+}
+
+std::vector<std::vector<std::int32_t>> BPETokenizer::TokenizeBatch(const std::vector<std::string>& texts) {
+    if (texts.empty()) {
+        return {};
+    }
+
+    thread_local const Impl* tls_owner = nullptr;
+    thread_local std::unique_ptr<tokenizers::Tokenizer> tls_tokenizer;
+    if (tls_owner != impl_.get() || !tls_tokenizer) {
+        tls_tokenizer = impl_->CreateTokenizer();
+        tls_owner = impl_.get();
+    }
+
+    if (!TimingLoggingEnabled()) {
+        return tls_tokenizer->EncodeBatch(texts);
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto batch_ids = tls_tokenizer->EncodeBatch(texts);
+    auto t1 = std::chrono::steady_clock::now();
+    long long dt_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    long long total_us = g_tokenize_total_us.fetch_add(dt_us, std::memory_order_relaxed) + dt_us;
+    std::fprintf(stderr, "[LOG] BatchTime: %lld us, BatchSize: %zu, Total: %lld us\n",
+                 dt_us, texts.size(), total_us);
+    return batch_ids;
 }
 
 } // namespace Runtime::BPE

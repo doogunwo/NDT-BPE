@@ -8,8 +8,8 @@ namespace {
 void print_usage(const char* prog) {
     std::fprintf(stderr,
                  "Usage: %s [--mode=txt|arrow] [--exec-mode=inline|thread|process] [--workers=N]\n"
-                 "  txt   : payload is UTF-8 text\n"
-                 "  arrow : payload is Arrow text-buffer chunk, not full Arrow IPC/file\n"
+                 "  txt   : payload is pure bounded UTF-8 text\n"
+                 "  arrow : compatibility alias; runtime still consumes pure bounded UTF-8 text\n"
                  "  inline  : one runtime loop polls all slot-local eventfds\n"
                  "  thread  : worker threads poll owned slot-local eventfds\n"
                  "  process : worker processes poll owned slot-local eventfds\n",

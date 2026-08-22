@@ -55,6 +55,7 @@ clean_shm:
 	@for key in $$(printf "0x%x\n" $$(seq $$((0x1200)) $$((0x123f)))); do ipcrm -M $$key 2>/dev/null || true; done
 	@for key in $$(printf "0x%x\n" $$(seq $$((0x1400)) $$((0x143f)))); do ipcrm -M $$key 2>/dev/null || true; done
 	@for key in $$(printf "0x%x\n" $$(seq $$((0x1600)) $$((0x163f)))); do ipcrm -M $$key 2>/dev/null || true; done
+	@for bank in $$(seq 0 15); do for root in 0x3000 0x4000; do base=$$((root + bank * 0x100)); for key in $$(seq $$base $$((base + 0x3f))); do ipcrm -M $$key 2>/dev/null || true; done; done; done
 	@ipcrm -M 0x2000 2>/dev/null || true
 	@ipcrm -M 0x2100 2>/dev/null || true
 	@ipcrm -M 0x2200 2>/dev/null || true

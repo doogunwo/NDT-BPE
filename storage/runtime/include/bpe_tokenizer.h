@@ -20,6 +20,7 @@ public:
     // 토큰화 수행
     std::vector<std::int32_t> Tokenize(const std::string& text);
     std::vector<std::int32_t> Tokenize(std::string_view text);
+    std::vector<std::vector<std::int32_t>> TokenizeBatch(const std::vector<std::string>& texts);
 
     // 경로 초기화 (Instance 호출 전에만 유효)
     static void Init(std::string model_path, std::string merges_path);

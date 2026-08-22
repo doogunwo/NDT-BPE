@@ -8,20 +8,20 @@
 
 #include <sys/ipc.h>
 
-constexpr key_t SHM_READ_KEY = 0x1000;
-constexpr key_t SHM_WRITE_KEY = 0x1200;
-constexpr key_t SHM_READ_KEY_BANK1 = 0x1400;
-constexpr key_t SHM_WRITE_KEY_BANK1 = 0x1600;
-constexpr std::size_t SHM_SIZE = 131072; // 128 KiB per bank
+constexpr key_t SHM_READ_KEY = 0x3000;
+constexpr key_t SHM_WRITE_KEY = 0x4000;
+constexpr key_t SHM_BANK_STRIDE = 0x100;
+constexpr std::size_t INPUT_SHM_SIZE = 131072;  // 128 KiB per input bank
+constexpr std::size_t OUTPUT_SHM_SIZE = 524288; // worst case: one int32 token per input byte
 constexpr std::size_t NUM_SLOTS = 64;
-constexpr std::size_t NUM_BUFFERS = 2;
+constexpr std::size_t NUM_BUFFERS = 16;
 
 constexpr key_t STATS_SHM_KEY = 0x2000;
 constexpr std::size_t STATS_SHM_SIZE = 4096;
 constexpr key_t IPC_CONFIG_SHM_KEY = 0x2100;
 constexpr std::size_t IPC_CONFIG_SHM_SIZE = 256;
 constexpr key_t IPC_STATE_SHM_KEY = 0x2200;
-constexpr std::size_t IPC_STATE_SHM_SIZE = 4096;
+constexpr std::size_t IPC_STATE_SHM_SIZE = 65536;
 inline constexpr const char* EVENTFD_SOCKET_PATH = "/var/tmp/ndt_bpe_eventfd.sock";
 constexpr std::uint32_t BPE_OUTPUT_ERROR = 0xFFFFFFFFU;
 
@@ -109,21 +109,7 @@ enum class ExecMode : std::uint32_t {
     kProcess = 2,
 };
 
-// Arrow mode does not receive a full Arrow IPC/file payload.
-// It receives bytes from the Arrow text values buffer path described by
-// `compute/src/extent-index.cpp`. Optional framing allows the producer to
-// identify the valid subrange inside an aligned storage chunk.
-struct __attribute__((packed)) ArrowChunkHeader {
-    std::uint32_t magic = 0x41525458U; // "ARTX"
-    std::uint16_t version = 1;
-    std::uint16_t reserved = 0;
-    std::uint32_t payload_offset = 0;
-    std::uint32_t payload_length = 0;
-    std::uint64_t data_range_offset = 0;
-    std::int64_t batch_index = -1;
-    std::int64_t num_rows = -1;
-};
-
+// kArrow is kept as a command-line compatibility alias. Runtime input is always a pure bounded UTF-8 text payload; Arrow parsing is performed before staging on the host side.
 class ShmSlotWorker {
 public:
     using BankPtrs = std::array<char*, NUM_BUFFERS>;

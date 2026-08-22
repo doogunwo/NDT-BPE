@@ -26,7 +26,6 @@ namespace {
 constexpr std::uint64_t kStatsMagic = 0x4250455354415431ULL; // "BPESTAT1"
 constexpr std::uint64_t kIpcConfigMagic = 0x4250454346473031ULL; // "BPECFG01"
 constexpr std::uint64_t kIpcStateMagic = 0x4250455354415445ULL; // "BPESTATE"
-constexpr std::uint32_t kArrowChunkMagic = 0x41525458U; // "ARTX"
 
 struct SegmentPair {
     int id = -1;
@@ -135,14 +134,14 @@ void reset_ipc_state(BpeRuntimeIpcState* state) {
 }
 
 key_t slot_segment_key(bool is_read, std::size_t slot, std::size_t bank_index) {
-    const key_t base =
-        is_read ? (bank_index == 0 ? SHM_READ_KEY : SHM_READ_KEY_BANK1)
-                : (bank_index == 0 ? SHM_WRITE_KEY : SHM_WRITE_KEY_BANK1);
-    return base + static_cast<key_t>(slot);
+    const key_t base = is_read ? SHM_READ_KEY : SHM_WRITE_KEY;
+    return base + static_cast<key_t>(bank_index) * SHM_BANK_STRIDE +
+           static_cast<key_t>(slot);
 }
 
-SegmentPair attach_slot_segment(key_t key, const char* label, std::size_t slot, std::size_t bank_index) {
-    const int id = shmget(key, SHM_SIZE, IPC_CREAT | 0660);
+SegmentPair attach_slot_segment(key_t key, std::size_t segment_size, const char* label,
+                                std::size_t slot, std::size_t bank_index) {
+    const int id = shmget(key, segment_size, IPC_CREAT | 0660);
     if (id < 0) {
         throw std::runtime_error(std::string(label) + " shmget failed for slot " +
                                  std::to_string(slot) + " bank " +
@@ -155,11 +154,11 @@ SegmentPair attach_slot_segment(key_t key, const char* label, std::size_t slot, 
                                  std::to_string(slot) + " bank " +
                                  std::to_string(bank_index) + ": " + std::strerror(errno));
     }
-    if (static_cast<std::size_t>(ds.shm_segsz) != SHM_SIZE) {
+    if (static_cast<std::size_t>(ds.shm_segsz) != segment_size) {
         throw std::runtime_error(std::string(label) + " SHM size mismatch for slot " +
                                  std::to_string(slot) + " bank " +
                                  std::to_string(bank_index) + ": expected " +
-                                 std::to_string(SHM_SIZE) + ", got " +
+                                 std::to_string(segment_size) + ", got " +
                                  std::to_string(static_cast<std::size_t>(ds.shm_segsz)));
     }
 
@@ -229,99 +228,6 @@ bool is_valid_utf8(std::string_view s) {
     return true;
 }
 
-bool decode_one_utf8(std::string_view s, std::size_t pos, std::size_t* next_pos) {
-    if (pos >= s.size()) {
-        return false;
-    }
-    const auto* p = reinterpret_cast<const unsigned char*>(s.data());
-    const unsigned char c = p[pos];
-    if (c <= 0x7F) {
-        *next_pos = pos + 1;
-        return true;
-    }
-    if ((c >> 5) == 0x6) {
-        if (pos + 1 < s.size() && (p[pos + 1] & 0xC0) == 0x80 && c >= 0xC2) {
-            *next_pos = pos + 2;
-            return true;
-        }
-        return false;
-    }
-    if ((c >> 4) == 0xE) {
-        if (pos + 2 >= s.size()) {
-            return false;
-        }
-        if ((p[pos + 1] & 0xC0) != 0x80 || (p[pos + 2] & 0xC0) != 0x80) {
-            return false;
-        }
-        if (c == 0xE0 && p[pos + 1] < 0xA0) {
-            return false;
-        }
-        if (c == 0xED && p[pos + 1] >= 0xA0) {
-            return false;
-        }
-        *next_pos = pos + 3;
-        return true;
-    }
-    if ((c >> 3) == 0x1E) {
-        if (pos + 3 >= s.size()) {
-            return false;
-        }
-        if ((p[pos + 1] & 0xC0) != 0x80 ||
-            (p[pos + 2] & 0xC0) != 0x80 ||
-            (p[pos + 3] & 0xC0) != 0x80) {
-            return false;
-        }
-        if (c == 0xF0 && p[pos + 1] < 0x90) {
-            return false;
-        }
-        if (c == 0xF4 && p[pos + 1] >= 0x90) {
-            return false;
-        }
-        if (c > 0xF4) {
-            return false;
-        }
-        *next_pos = pos + 4;
-        return true;
-    }
-    return false;
-}
-
-std::string sanitize_arrow_text_chunk(std::string_view raw) {
-    std::string out;
-    out.reserve(raw.size());
-
-    bool dropped_run = false;
-    std::size_t i = 0;
-    while (i < raw.size()) {
-        std::size_t next = i;
-        if (decode_one_utf8(raw, i, &next)) {
-            if (dropped_run && !out.empty() && out.back() != ' ') {
-                out.push_back(' ');
-            }
-            dropped_run = false;
-
-            const unsigned char c = static_cast<unsigned char>(raw[i]);
-            if (c == 0) {
-                if (!out.empty() && out.back() != ' ') {
-                    out.push_back(' ');
-                }
-            } else {
-                out.append(raw.data() + i, next - i);
-            }
-            i = next;
-            continue;
-        }
-
-        dropped_run = true;
-        ++i;
-    }
-
-    while (!out.empty() && out.back() == ' ') {
-        out.pop_back();
-    }
-    return out;
-}
-
 std::string preview_text_for_log(std::string_view raw, std::size_t limit = 64) {
     const std::size_t n = std::min(raw.size(), limit);
     std::string out;
@@ -339,20 +245,90 @@ std::string preview_text_for_log(std::string_view raw, std::size_t limit = 64) {
     return out;
 }
 
-std::optional<std::string_view> parse_arrow_chunk_payload(const char* data, std::size_t len) {
-    if (len < sizeof(ArrowChunkHeader)) {
-        return std::nullopt;
+constexpr std::uint32_t kNdtPackedPayloadMagic = 0x31504b4eU; // "NKP1"
+constexpr std::uint32_t kNdtPackedPayloadVersion = 1U;
+constexpr std::size_t kNdtPackedPayloadHeaderBytes = 16U;
+
+std::uint32_t read_u32_le(const char* p) {
+    const auto b0 = static_cast<std::uint32_t>(static_cast<unsigned char>(p[0]));
+    const auto b1 = static_cast<std::uint32_t>(static_cast<unsigned char>(p[1]));
+    const auto b2 = static_cast<std::uint32_t>(static_cast<unsigned char>(p[2]));
+    const auto b3 = static_cast<std::uint32_t>(static_cast<unsigned char>(p[3]));
+    return b0 | (b1 << 8U) | (b2 << 16U) | (b3 << 24U);
+}
+
+bool is_ndt_packed_payload(std::string_view payload) {
+    if (payload.size() < kNdtPackedPayloadHeaderBytes) {
+        return false;
     }
-    const auto* hdr = reinterpret_cast<const ArrowChunkHeader*>(data);
-    if (hdr->magic != kArrowChunkMagic || hdr->version != 1) {
-        return std::nullopt;
+    return read_u32_le(payload.data()) == kNdtPackedPayloadMagic;
+}
+
+std::vector<std::int32_t> tokenize_pure_text_payload(std::string_view input_text) {
+    if (input_text.empty()) {
+        return {};
     }
-    const std::size_t off = hdr->payload_offset;
-    const std::size_t plen = hdr->payload_length;
-    if (off > len || plen > len || off + plen > len) {
-        throw std::runtime_error("arrow chunk header has invalid payload range");
+    if (!is_valid_utf8(input_text)) {
+        throw std::runtime_error("pure text payload is not valid UTF-8");
     }
-    return std::string_view(data + off, plen);
+    return Runtime::BPE::BPETokenizer::Instance().Tokenize(input_text);
+}
+
+std::vector<std::int32_t> tokenize_ndt_packed_payload(std::string_view payload,
+                                                      std::size_t* record_count_out) {
+    if (payload.size() < kNdtPackedPayloadHeaderBytes) {
+        throw std::runtime_error("NDT packed payload is shorter than header");
+    }
+    const std::uint32_t magic = read_u32_le(payload.data());
+    const std::uint32_t version = read_u32_le(payload.data() + 4);
+    const std::uint32_t record_count = read_u32_le(payload.data() + 8);
+    const std::uint32_t data_offset = read_u32_le(payload.data() + 12);
+    if (magic != kNdtPackedPayloadMagic) {
+        throw std::runtime_error("invalid NDT packed payload magic");
+    }
+    if (version != kNdtPackedPayloadVersion) {
+        throw std::runtime_error("unsupported NDT packed payload version");
+    }
+    if (record_count == 0) {
+        if (record_count_out != nullptr) {
+            *record_count_out = 0;
+        }
+        return {};
+    }
+    const std::uint64_t expected_data_offset =
+        kNdtPackedPayloadHeaderBytes +
+        static_cast<std::uint64_t>(record_count) * sizeof(std::uint32_t);
+    if (data_offset != expected_data_offset || data_offset > payload.size()) {
+        throw std::runtime_error("invalid NDT packed payload data offset");
+    }
+
+    std::vector<std::int32_t> all_ids;
+    std::size_t pos = data_offset;
+    for (std::uint32_t i = 0; i < record_count; ++i) {
+        const std::size_t len_off =
+            kNdtPackedPayloadHeaderBytes +
+            static_cast<std::size_t>(i) * sizeof(std::uint32_t);
+        const std::uint32_t record_len = read_u32_le(payload.data() + len_off);
+        if (record_len > payload.size() - pos) {
+            throw std::runtime_error("NDT packed payload record length exceeds payload");
+        }
+        const std::string_view record(payload.data() + pos, record_len);
+        if (!record.empty()) {
+            if (!is_valid_utf8(record)) {
+                throw std::runtime_error("NDT packed record is not valid UTF-8");
+            }
+            auto ids = Runtime::BPE::BPETokenizer::Instance().Tokenize(record);
+            all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+        }
+        pos += record_len;
+    }
+    if (pos != payload.size()) {
+        throw std::runtime_error("NDT packed payload has trailing bytes");
+    }
+    if (record_count_out != nullptr) {
+        *record_count_out = record_count;
+    }
+    return all_ids;
 }
 
 std::size_t default_exec_workers() {
@@ -425,7 +401,7 @@ std::uint32_t process_request_bytes(const std::vector<ShmSlotWorker>& workers,
     if (slot >= workers.size()) {
         return BPE_OUTPUT_ERROR;
     }
-    const std::uint32_t total_len = std::min<std::uint32_t>(req.total_len, SHM_SIZE);
+    const std::uint32_t total_len = std::min<std::uint32_t>(req.total_len, INPUT_SHM_SIZE);
     try {
         return workers[slot].Process(bank_index, total_len);
     } catch (const std::exception& ex) {
@@ -476,7 +452,7 @@ void drain_eventfd_counter(int fd) {
 }
 
 bool send_fds(int sock_fd, const EventfdHandshakeMsg& msg, const int* fds, std::size_t fd_count) {
-    char control[CMSG_SPACE(sizeof(int) * NUM_BUFFERS)] = {};
+    char control[CMSG_SPACE(sizeof(int) * 2)] = {};
     struct iovec iov {
         .iov_base = const_cast<EventfdHandshakeMsg*>(&msg),
         .iov_len = sizeof(msg),
@@ -545,11 +521,11 @@ void publish_eventfds_and_wait_for_peer(const std::array<SlotEventFds, NUM_SLOTS
             static_cast<std::uint32_t>(slot),
             0,
         };
-        const int fds[NUM_BUFFERS] = {
+        const int fds[2] = {
             slot_fds[slot].req_fd,
             slot_fds[slot].cpl_fd,
         };
-        if (!send_fds(client_fd, msg, fds, NUM_BUFFERS)) {
+        if (!send_fds(client_fd, msg, fds, 2)) {
             ::close(client_fd);
             ::close(server_fd);
             throw std::runtime_error("failed to publish eventfds to SPDK");
@@ -657,8 +633,10 @@ void drain_slot_ready_buffers(std::size_t slot,
                          bank_index,
                          static_cast<unsigned long long>(req.req_id),
                          req.total_len);
+            const std::uint64_t process_start_us = now_us();
             const std::uint32_t output_len =
                 process_request_bytes(workers, slot, bank_index, req);
+            const std::uint64_t process_done_us = now_us();
             std::fprintf(stderr, "[BPE] runtime done slot=%zu bank=%zu req_id=%llu input_len=%u output_len=%u\n",
                          slot,
                          bank_index,
@@ -669,8 +647,27 @@ void drain_slot_ready_buffers(std::size_t slot,
             const std::uint32_t stats_len =
                 (output_len == BPE_OUTPUT_ERROR) ? 0 : output_len;
             record_response_stats(stats, req, stats_len, t0, t1);
+            const std::uint64_t mark_start_us = now_us();
             mark_buffer_done(ipc_state, slot, bank_index, output_len);
+            const std::uint64_t mark_done_us = now_us();
             (void)signal_eventfd(slot_fds.cpl_fd);
+            const std::uint64_t signal_done_us = now_us();
+            std::fprintf(stderr,
+                         "[BPE_RUNTIME_BREAKDOWN] req_id=%llu slot=%zu bank=%zu "
+                         "claim_to_process_us=%llu process_request_us=%llu "
+                         "stats_us=%llu mark_done_us=%llu completion_eventfd_us=%llu "
+                         "runtime_total_us=%llu input_len=%u output_len=%u\n",
+                         static_cast<unsigned long long>(req.req_id),
+                         slot,
+                         bank_index,
+                         static_cast<unsigned long long>(process_start_us - t0),
+                         static_cast<unsigned long long>(process_done_us - process_start_us),
+                         static_cast<unsigned long long>(t1 - process_done_us),
+                         static_cast<unsigned long long>(mark_done_us - mark_start_us),
+                         static_cast<unsigned long long>(signal_done_us - mark_done_us),
+                         static_cast<unsigned long long>(signal_done_us - t0),
+                         req.total_len,
+                         output_len);
             did_work = true;
         }
         if (!did_work) {
@@ -736,51 +733,49 @@ std::uint32_t ShmSlotWorker::Process(std::size_t bank_index, std::uint32_t input
         throw std::runtime_error("slot worker is not initialized");
     }
 
-    const std::size_t safe_len = std::min<std::size_t>(input_len, SHM_SIZE);
+    const std::size_t safe_len = std::min<std::size_t>(input_len, INPUT_SHM_SIZE);
     std::vector<std::int32_t> token_ids;
-    if (mode_ == InputMode::kArrow) {
-        std::string_view payload(read_ptrs_[bank_index], safe_len);
-        bool framed = false;
-        if (auto framed_payload = parse_arrow_chunk_payload(read_ptrs_[bank_index], safe_len);
-            framed_payload.has_value()) {
-            payload = *framed_payload;
-            framed = true;
-        }
-        const std::string sanitized = sanitize_arrow_text_chunk(payload);
-        std::fprintf(stderr,
-                     "[BPE] tokenize slot=%u bank=%zu mode=arrow raw_len=%zu framed=%s payload_len=%zu sanitized_len=%zu preview=\"%s\"\n",
-                     slot_,
-                     bank_index,
-                     safe_len,
-                     framed ? "yes" : "no",
-                     payload.size(),
-                     sanitized.size(),
-                     preview_text_for_log(sanitized).c_str());
-        if (sanitized.empty()) {
-            throw std::runtime_error(
-                "arrow chunk mode found no decodable UTF-8 text; payload must be a text-buffer "
-                "slice from extent-index, not a full Arrow IPC/file blob");
-        }
-        token_ids = Runtime::BPE::BPETokenizer::Instance().Tokenize(sanitized);
-    } else {
+    const std::uint64_t process_start_us = now_us();
+    std::uint64_t parse_done_us = process_start_us;
+    std::uint64_t tokenize_done_us = process_start_us;
+    std::uint64_t copy_done_us = process_start_us;
+    {
         const std::string_view input_text(read_ptrs_[bank_index], safe_len);
-        const bool utf8_ok = is_valid_utf8(input_text);
+        parse_done_us = now_us();
+        const bool packed = is_ndt_packed_payload(input_text);
+        const bool utf8_ok = packed ? true : is_valid_utf8(input_text);
+        std::size_t packed_records = 0;
         std::fprintf(stderr,
-                     "[BPE] tokenize slot=%u bank=%zu mode=txt raw_len=%zu utf8=%s preview=\"%s\"\n",
+                     "[BPE] tokenize slot=%u bank=%zu mode=%s raw_len=%zu utf8=%s preview=\"%s\"\n",
                      slot_,
                      bank_index,
+                     packed ? "ndt_packed" : "pure_text",
                      safe_len,
                      utf8_ok ? "yes" : "no",
                      preview_text_for_log(input_text).c_str());
-        if (!utf8_ok) {
-            throw std::runtime_error("text payload is not valid UTF-8");
+        const std::uint64_t tokenize_start_us = now_us();
+        if (packed) {
+            token_ids = tokenize_ndt_packed_payload(input_text, &packed_records);
+        } else {
+            token_ids = tokenize_pure_text_payload(input_text);
         }
-        token_ids = Runtime::BPE::BPETokenizer::Instance().Tokenize(input_text);
+        tokenize_done_us = now_us();
+        parse_done_us = tokenize_start_us;
+        if (packed) {
+            std::fprintf(stderr,
+                         "[BPE] packed-records slot=%u bank=%zu records=%zu\n",
+                         slot_,
+                         bank_index,
+                         packed_records);
+        }
     }
 
     auto* dest = reinterpret_cast<std::int32_t*>(write_ptrs_[bank_index]);
-    const std::size_t max_ids = SHM_SIZE / sizeof(std::int32_t);
-    const std::size_t copy_count = std::min(token_ids.size(), max_ids);
+    const std::size_t max_ids = OUTPUT_SHM_SIZE / sizeof(std::int32_t);
+    if (token_ids.size() > max_ids) {
+        throw std::runtime_error("BPE output exceeds overflow-safe output bank");
+    }
+    const std::size_t copy_count = token_ids.size();
     if (copy_count > 0) {
         const std::size_t sample = std::min<std::size_t>(copy_count, 8);
         std::fprintf(stderr,
@@ -795,8 +790,21 @@ std::uint32_t ShmSlotWorker::Process(std::size_t bank_index, std::uint32_t input
     if (copy_count > 0) {
         std::memcpy(dest, token_ids.data(), copy_count * sizeof(std::int32_t));
     }
+    copy_done_us = now_us();
 
     const std::uint32_t output_len = static_cast<std::uint32_t>(copy_count * sizeof(std::int32_t));
+    std::fprintf(stderr,
+                 "[BPE_RUNTIME_STAGE] slot=%u bank=%zu "
+                 "input_prepare_us=%llu tokenize_us=%llu output_copy_us=%llu "
+                 "process_total_us=%llu tokens=%zu output_bytes=%u\n",
+                 slot_,
+                 bank_index,
+                 static_cast<unsigned long long>(parse_done_us - process_start_us),
+                 static_cast<unsigned long long>(tokenize_done_us - parse_done_us),
+                 static_cast<unsigned long long>(copy_done_us - tokenize_done_us),
+                 static_cast<unsigned long long>(copy_done_us - process_start_us),
+                 copy_count,
+                 output_len);
     std::fprintf(stderr,
                  "[BPE] tokenize-done slot=%u bank=%zu tokens=%zu output_bytes=%u\n",
                  slot_,
@@ -818,9 +826,11 @@ SharedMemorySlots::SharedMemorySlots() {
         try {
             for (std::size_t bank_index = 0; bank_index < NUM_BUFFERS; ++bank_index) {
                 const SegmentPair read_seg =
-                    attach_slot_segment(slot_segment_key(true, slot, bank_index), "read", slot, bank_index);
+                    attach_slot_segment(slot_segment_key(true, slot, bank_index), INPUT_SHM_SIZE,
+                                        "read", slot, bank_index);
                 const SegmentPair write_seg =
-                    attach_slot_segment(slot_segment_key(false, slot, bank_index), "write", slot, bank_index);
+                    attach_slot_segment(slot_segment_key(false, slot, bank_index), OUTPUT_SHM_SIZE,
+                                        "write", slot, bank_index);
                 read_ids_[slot][bank_index] = read_seg.id;
                 write_ids_[slot][bank_index] = write_seg.id;
                 read_ptrs_[slot][bank_index] = read_seg.ptr;

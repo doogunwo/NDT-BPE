@@ -10,7 +10,7 @@ MODE="${2:-arrow}"
 EXEC_MODE="${3:-process}"
 WORKERS="${4:-16}"
 LOG_PATH="${5:-/tmp/${SESSION_NAME}.log}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="/home/doogunwo/NDT-BPE/storage/runtime"
 
 cd "${ROOT_DIR}"
 if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then

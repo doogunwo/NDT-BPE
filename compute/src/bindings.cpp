@@ -7,6 +7,7 @@
 #include "fallocate.h"
 #include "io-uring.h"       // Ring, submit_nvme_passthru
 #include "fiemap_schedule.h" // convert_fiemap_to_nvme_segs
+#include "ndt_cache_ioctl.h"
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -1742,6 +1743,64 @@ bool drop_file_cache(const std::string& path, std::size_t size_bytes, std::strin
     return true;
 }
 
+bool strict_kernel_cache_coherence() {
+    const char* value = std::getenv("NDT_CACHE_COHERENCE_STRICT");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+const char* kernel_cache_control_path() {
+    const char* value = std::getenv("NDT_CACHE_CONTROL_DEV");
+    return (value != nullptr && value[0] != '\0') ? value : "/dev/ndt_cache";
+}
+
+// Page-cache entries are indexed by inode and file offset, not by NVMe LBA.
+// The compute layer already owns the route from file offsets to output LBAs,
+// so it passes the file range to the kernel before lending the route and after
+// every storage-side write has completed.
+bool kernel_cache_range(const std::string& path,
+                        std::uint64_t offset,
+                        std::uint64_t length,
+                        unsigned long request,
+                        bool required,
+                        bool& used,
+                        std::string& err) {
+    used = false;
+    if (length == 0) {
+        return true;
+    }
+
+    const char* control_path = kernel_cache_control_path();
+    const int control_fd = ::open(control_path, O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0) {
+        if (!required && errno == ENOENT) {
+            return true;
+        }
+        err = std::string("open ") + control_path + " failed: " + std::strerror(errno);
+        return false;
+    }
+    const int target_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (target_fd < 0) {
+        err = std::string("open cache-coherence target failed: ") + std::strerror(errno);
+        ::close(control_fd);
+        return false;
+    }
+
+    ndt_cache_range range{};
+    range.target_fd = target_fd;
+    range.offset = offset;
+    range.length = length;
+    const int rc = ::ioctl(control_fd, request, &range);
+    const int saved_errno = errno;
+    ::close(target_fd);
+    ::close(control_fd);
+    if (rc != 0) {
+        err = std::string("NDT cache-range ioctl failed: ") + std::strerror(saved_errno);
+        return false;
+    }
+    used = true;
+    return true;
+}
+
 void prepare_metadata_output_routes(const std::string& input_path,
                                     const std::string& source_index_path,
                                     const std::string& output_path,
@@ -1749,7 +1808,8 @@ void prepare_metadata_output_routes(const std::string& input_path,
                                     std::vector<NvmeSeg>& command_index_segs,
                                     std::vector<NdtOutputRoute>& routes,
                                     std::vector<std::uint64_t>& output_offsets,
-                                    std::size_t& output_pool_bytes) {
+                                    std::size_t& output_pool_bytes,
+                                    bool& kernel_cache_coherence) {
     const int source_fd = ::open(source_index_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (source_fd < 0) {
         throw std::runtime_error(std::string("open source NDT index failed: ") +
@@ -1807,8 +1867,15 @@ void prepare_metadata_output_routes(const std::string& input_path,
         throw std::runtime_error("prepare NDT output allocation failed: " + prepare_err);
     }
     std::string cache_err;
-    if (!drop_file_cache(output_path, output_pool_bytes, &cache_err)) {
-        throw std::runtime_error("flush/invalidate NDT output before direct-LBA write failed: " +
+    const bool strict_coherence = strict_kernel_cache_coherence();
+    if (!kernel_cache_range(output_path, 0, output_pool_bytes,
+                            NDT_CACHE_BEGIN_RANGE, strict_coherence,
+                            kernel_cache_coherence, cache_err)) {
+        throw std::runtime_error("begin NDT output cache-coherence range failed: " + cache_err);
+    }
+    if (!kernel_cache_coherence &&
+        !drop_file_cache(output_path, output_pool_bytes, &cache_err)) {
+        throw std::runtime_error("invalidate NDT output before direct-LBA write failed: " +
                                  cache_err);
     }
     for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -2079,6 +2146,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
     std::size_t breakdown_completion_count = 0;
     std::string stage_path;
     bool stage_cache_hit = false;
+    bool kernel_cache_coherence = false;
     const ArrowStageMode stage_mode = parse_arrow_stage_mode(stage_mode_name);
 
     {
@@ -2122,7 +2190,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
         if (metadata_index_input) {
             prepare_metadata_output_routes(input_path, stage_path, out_path, max_extents,
                                            in_segs, output_routes, output_offsets,
-                                           output_pool_bytes);
+                                           output_pool_bytes, kernel_cache_coherence);
         }
         breakdown_output_prepare_us += now_us() - tb0;
 
@@ -2410,11 +2478,55 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
         ::close(dev_fd);
         breakdown_close_us += now_us() - tb0;
 
-        if (!ok) {
+        if (!ok || errors != 0) {
+            // Some commands may already have updated their physical output
+            // blocks.  Never leave stale host pages behind, even though no
+            // manifest will be published for this failed run.
+            std::string failure_cache_err;
+            if (metadata_index_input) {
+                if (kernel_cache_coherence) {
+                    bool completion_used = false;
+                    if (!kernel_cache_range(out_path, 0, output_pool_bytes,
+                                            NDT_CACHE_COMPLETE_RANGE, true,
+                                            completion_used, failure_cache_err) ||
+                        !completion_used) {
+                        throw std::runtime_error(
+                            "tokenize_to_nvme failed; output cache invalidation also failed: " +
+                            failure_cache_err);
+                    }
+                } else if (!drop_file_cache(out_path, output_pool_bytes,
+                                            &failure_cache_err)) {
+                    throw std::runtime_error(
+                        "tokenize_to_nvme failed; output cache invalidation also failed: " +
+                        failure_cache_err);
+                }
+            }
             throw std::runtime_error("tokenize_to_nvme failed");
         }
 
         std::string cache_drop_err;
+        tb0 = now_us();
+        if (metadata_index_input) {
+            if (kernel_cache_coherence) {
+                bool completion_used = false;
+                if (!kernel_cache_range(out_path, 0, output_pool_bytes,
+                                        NDT_CACHE_COMPLETE_RANGE, true,
+                                        completion_used, cache_drop_err) ||
+                    !completion_used) {
+                    throw std::runtime_error(
+                        "complete NDT output cache-coherence range failed: " +
+                        cache_drop_err);
+                }
+            } else if (!drop_file_cache(out_path, output_pool_bytes, &cache_drop_err)) {
+                throw std::runtime_error(
+                    "invalidate NDT output after direct-LBA write failed: " +
+                    cache_drop_err);
+            }
+        }
+        breakdown_cache_drop_us += now_us() - tb0;
+
+        // Publish valid lengths only after the storage writes are complete and
+        // stale host pages have been invalidated.
         tb0 = now_us();
         const std::string manifest_path = out_path + ".ndtmanifest";
         FILE* manifest = std::fopen(manifest_path.c_str(), "w");
@@ -2434,13 +2546,6 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
         }
         std::fclose(manifest);
         breakdown_manifest_us += now_us() - tb0;
-        tb0 = now_us();
-        struct stat output_st {};
-        if (::stat(out_path.c_str(), &output_st) == 0 &&
-            !drop_file_cache(out_path, output_pool_bytes, &cache_drop_err) && verbose) {
-            std::fprintf(stderr, "[WARN] %s\n", cache_drop_err.c_str());
-        }
-        breakdown_cache_drop_us += now_us() - tb0;
 
         const double t1 = now_us();
         elapsed_us = t1 - t0;
@@ -2471,6 +2576,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
     result["stage_path"] = stage_path;
     result["stage_mode"] = stage_mode_name;
     result["stage_cache_hit"] = stage_cache_hit;
+    result["kernel_cache_coherence"] = kernel_cache_coherence;
     result["out_path"] = out_path;
     return result;
 }

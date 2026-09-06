@@ -1753,53 +1753,109 @@ const char* kernel_cache_control_path() {
     return (value != nullptr && value[0] != '\0') ? value : "/dev/ndt_cache";
 }
 
-// Page-cache entries are indexed by inode and file offset, not by NVMe LBA.
-// The compute layer already owns the route from file offsets to output LBAs,
-// so it passes the file range to the kernel before lending the route and after
-// every storage-side write has completed.
-bool kernel_cache_range(const std::string& path,
-                        std::uint64_t offset,
-                        std::uint64_t length,
-                        unsigned long request,
-                        bool required,
-                        bool& used,
-                        std::string& err) {
-    used = false;
-    if (length == 0) {
+// Keep the control FD open for the complete storage-side operation.  The
+// kernel binds write denial to this FD and automatically releases it if the
+// process exits before COMPLETE.
+class KernelCacheLease {
+public:
+    KernelCacheLease() = default;
+    KernelCacheLease(const KernelCacheLease&) = delete;
+    KernelCacheLease& operator=(const KernelCacheLease&) = delete;
+
+    ~KernelCacheLease() {
+        close_fds();
+    }
+
+    bool begin(const std::string& path,
+               std::uint64_t offset,
+               std::uint64_t length,
+               bool required,
+               std::string& err) {
+        if (length == 0) {
+            return true;
+        }
+        if (control_fd_ >= 0 || target_fd_ >= 0) {
+            err = "NDT cache lease is already active";
+            return false;
+        }
+
+        const char* control_path = kernel_cache_control_path();
+        control_fd_ = ::open(control_path, O_RDONLY | O_CLOEXEC);
+        if (control_fd_ < 0) {
+            if (!required && errno == ENOENT) {
+                return true;
+            }
+            err = std::string("open ") + control_path + " failed: " +
+                  std::strerror(errno);
+            return false;
+        }
+        // A read-only target FD does not increment inode->i_writecount.  The
+        // kernel module can therefore detect other writers and then make the
+        // write denial exclusive for the duration of this control FD.
+        target_fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (target_fd_ < 0) {
+            err = std::string("open cache-lease target failed: ") +
+                  std::strerror(errno);
+            close_fds();
+            return false;
+        }
+
+        range_.target_fd = target_fd_;
+        range_.offset = offset;
+        range_.length = length;
+        if (::ioctl(control_fd_, NDT_CACHE_BEGIN_RANGE, &range_) != 0) {
+            const int saved_errno = errno;
+            err = std::string("NDT cache lease BEGIN failed: ") +
+                  std::strerror(saved_errno);
+            close_fds();
+            return false;
+        }
+        active_ = true;
+        used_ = true;
         return true;
     }
 
-    const char* control_path = kernel_cache_control_path();
-    const int control_fd = ::open(control_path, O_RDONLY | O_CLOEXEC);
-    if (control_fd < 0) {
-        if (!required && errno == ENOENT) {
+    bool complete(std::string& err) {
+        if (!used_) {
             return true;
         }
-        err = std::string("open ") + control_path + " failed: " + std::strerror(errno);
-        return false;
-    }
-    const int target_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (target_fd < 0) {
-        err = std::string("open cache-coherence target failed: ") + std::strerror(errno);
-        ::close(control_fd);
-        return false;
+        if (!active_ || control_fd_ < 0 || target_fd_ < 0) {
+            err = "NDT cache lease is not active";
+            return false;
+        }
+        if (::ioctl(control_fd_, NDT_CACHE_COMPLETE_RANGE, &range_) != 0) {
+            err = std::string("NDT cache lease COMPLETE failed: ") +
+                  std::strerror(errno);
+            return false;
+        }
+        active_ = false;
+        close_fds();
+        return true;
     }
 
-    ndt_cache_range range{};
-    range.target_fd = target_fd;
-    range.offset = offset;
-    range.length = length;
-    const int rc = ::ioctl(control_fd, request, &range);
-    const int saved_errno = errno;
-    ::close(target_fd);
-    ::close(control_fd);
-    if (rc != 0) {
-        err = std::string("NDT cache-range ioctl failed: ") + std::strerror(saved_errno);
-        return false;
+    bool used() const { return used_; }
+
+private:
+    void close_fds() {
+        // Closing the control FD first invokes the kernel .release() fallback
+        // while the target FD is still valid in this process.
+        if (control_fd_ >= 0) {
+            ::close(control_fd_);
+            control_fd_ = -1;
+        }
+        if (target_fd_ >= 0) {
+            ::close(target_fd_);
+            target_fd_ = -1;
+        }
+        active_ = false;
     }
-    used = true;
-    return true;
-}
+
+    int control_fd_ = -1;
+    int target_fd_ = -1;
+    ndt_cache_range range_{};
+    bool active_ = false;
+    bool used_ = false;
+};
 
 void prepare_metadata_output_routes(const std::string& input_path,
                                     const std::string& source_index_path,
@@ -1809,7 +1865,7 @@ void prepare_metadata_output_routes(const std::string& input_path,
                                     std::vector<NdtOutputRoute>& routes,
                                     std::vector<std::uint64_t>& output_offsets,
                                     std::size_t& output_pool_bytes,
-                                    bool& kernel_cache_coherence) {
+                                    KernelCacheLease& output_lease) {
     const int source_fd = ::open(source_index_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (source_fd < 0) {
         throw std::runtime_error(std::string("open source NDT index failed: ") +
@@ -1868,12 +1924,11 @@ void prepare_metadata_output_routes(const std::string& input_path,
     }
     std::string cache_err;
     const bool strict_coherence = strict_kernel_cache_coherence();
-    if (!kernel_cache_range(output_path, 0, output_pool_bytes,
-                            NDT_CACHE_BEGIN_RANGE, strict_coherence,
-                            kernel_cache_coherence, cache_err)) {
-        throw std::runtime_error("begin NDT output cache-coherence range failed: " + cache_err);
+    if (!output_lease.begin(output_path, 0, output_pool_bytes,
+                            strict_coherence, cache_err)) {
+        throw std::runtime_error("begin NDT output write/layout lease failed: " + cache_err);
     }
-    if (!kernel_cache_coherence &&
+    if (!output_lease.used() &&
         !drop_file_cache(output_path, output_pool_bytes, &cache_err)) {
         throw std::runtime_error("invalidate NDT output before direct-LBA write failed: " +
                                  cache_err);
@@ -2147,6 +2202,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
     std::string stage_path;
     bool stage_cache_hit = false;
     bool kernel_cache_coherence = false;
+    KernelCacheLease output_cache_lease;
     const ArrowStageMode stage_mode = parse_arrow_stage_mode(stage_mode_name);
 
     {
@@ -2190,7 +2246,8 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
         if (metadata_index_input) {
             prepare_metadata_output_routes(input_path, stage_path, out_path, max_extents,
                                            in_segs, output_routes, output_offsets,
-                                           output_pool_bytes, kernel_cache_coherence);
+                                           output_pool_bytes, output_cache_lease);
+            kernel_cache_coherence = output_cache_lease.used();
         }
         breakdown_output_prepare_us += now_us() - tb0;
 
@@ -2485,11 +2542,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
             std::string failure_cache_err;
             if (metadata_index_input) {
                 if (kernel_cache_coherence) {
-                    bool completion_used = false;
-                    if (!kernel_cache_range(out_path, 0, output_pool_bytes,
-                                            NDT_CACHE_COMPLETE_RANGE, true,
-                                            completion_used, failure_cache_err) ||
-                        !completion_used) {
+                    if (!output_cache_lease.complete(failure_cache_err)) {
                         throw std::runtime_error(
                             "tokenize_to_nvme failed; output cache invalidation also failed: " +
                             failure_cache_err);
@@ -2508,11 +2561,7 @@ py::dict tokenize_to_nvme(const std::string& dev_path,
         tb0 = now_us();
         if (metadata_index_input) {
             if (kernel_cache_coherence) {
-                bool completion_used = false;
-                if (!kernel_cache_range(out_path, 0, output_pool_bytes,
-                                        NDT_CACHE_COMPLETE_RANGE, true,
-                                        completion_used, cache_drop_err) ||
-                    !completion_used) {
+                if (!output_cache_lease.complete(cache_drop_err)) {
                     throw std::runtime_error(
                         "complete NDT output cache-coherence range failed: " +
                         cache_drop_err);

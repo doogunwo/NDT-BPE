@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -61,7 +62,8 @@ int main(int argc, char **argv)
     unsigned char cached[BLOCK_BYTES];
     unsigned char *direct = NULL;
     uint64_t physical;
-    int file_fd, control_fd;
+    int file_fd, control_fd, second_control_fd, writer_fd;
+    void *writable_map;
 
     if (argc != 4) {
         fprintf(stderr, "usage: %s TEST_FILE BLOCK_DEVICE CONTROL_DEVICE\n", argv[0]);
@@ -111,44 +113,137 @@ int main(int argc, char **argv)
     require_pattern(cached, 'A', "buffered read before invalidation");
     puts("OBSERVED stale buffered page after raw physical-block write");
 
-    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
-    if (control_fd < 0)
-        die("open NDT cache control");
+    close(file_fd);
+    file_fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (file_fd < 0)
+        die("open read-only lease target");
     range.target_fd = file_fd;
     range.offset = 0;
     range.length = BLOCK_BYTES;
-    if (ioctl(control_fd, NDT_CACHE_COMPLETE_RANGE, &range) < 0)
-        die("NDT_CACHE_COMPLETE_RANGE");
-    close(control_fd);
 
-    if (pread(file_fd, cached, sizeof(cached), 0) != sizeof(cached))
-        die("buffered read after invalidation");
-    require_pattern(cached, 'B', "buffered read after invalidation");
-    puts("PASS: exact inode/file-offset invalidation exposed raw pattern B");
-
-    /* BEGIN must flush and invalidate a dirty host page before LBA ownership
-     * moves to storage.  Otherwise a later host writeback could overwrite D. */
-    memset(cached, 'C', sizeof(cached));
-    if (pwrite(file_fd, cached, sizeof(cached), 0) != sizeof(cached))
-        die("dirty buffered write C");
+    /* An already-open writer must make lease acquisition fail. */
+    writer_fd = open(argv[1], O_RDWR | O_CLOEXEC);
+    if (writer_fd < 0)
+        die("open conflicting writer");
     control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
     if (control_fd < 0)
-        die("open NDT cache control for BEGIN");
+        die("open NDT cache control");
+    errno = 0;
+    if (ioctl(control_fd, NDT_CACHE_BEGIN_RANGE, &range) == 0 || errno != ETXTBSY) {
+        fprintf(stderr, "BEGIN accepted an existing writable FD (errno=%d)\n", errno);
+        return EXIT_FAILURE;
+    }
+    close(control_fd);
+    close(writer_fd);
+    puts("PASS: BEGIN rejected an existing writable FD");
+
+    /* A writable mmap remains dangerous even after its FD is closed. */
+    writer_fd = open(argv[1], O_RDWR | O_CLOEXEC);
+    if (writer_fd < 0)
+        die("open writable mmap file");
+    writable_map = mmap(NULL, BLOCK_BYTES, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, writer_fd, 0);
+    if (writable_map == MAP_FAILED)
+        die("create writable mmap");
+    close(writer_fd);
+    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0)
+        die("open control for mmap rejection");
+    errno = 0;
+    if (ioctl(control_fd, NDT_CACHE_BEGIN_RANGE, &range) == 0 ||
+        (errno != EBUSY && errno != ETXTBSY)) {
+        fprintf(stderr, "BEGIN accepted a writable mmap (errno=%d)\n", errno);
+        return EXIT_FAILURE;
+    }
+    close(control_fd);
+    if (munmap(writable_map, BLOCK_BYTES))
+        die("remove writable mmap");
+    puts("PASS: BEGIN rejected an existing writable mmap");
+
+    /* Acquire the lease, then prove that new writable opens are denied. */
+    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0)
+        die("open control for active lease");
     if (ioctl(control_fd, NDT_CACHE_BEGIN_RANGE, &range) < 0)
         die("NDT_CACHE_BEGIN_RANGE");
-    close(control_fd);
+    second_control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
+    if (second_control_fd < 0)
+        die("open second lease control");
+    errno = 0;
+    if (ioctl(second_control_fd, NDT_CACHE_BEGIN_RANGE, &range) == 0 ||
+        errno != EBUSY) {
+        fprintf(stderr, "second control acquired the same inode (errno=%d)\n", errno);
+        return EXIT_FAILURE;
+    }
+    close(second_control_fd);
+    puts("PASS: global registry rejected a second lease on the same inode");
 
+    errno = 0;
+    writer_fd = open(argv[1], O_WRONLY | O_CLOEXEC);
+    if (writer_fd >= 0 || errno != ETXTBSY) {
+        fprintf(stderr, "active lease allowed a new writer (errno=%d)\n", errno);
+        return EXIT_FAILURE;
+    }
+    puts("PASS: active lease denied a new writable open");
+    errno = 0;
+    if (truncate(argv[1], 0) == 0 || errno != ETXTBSY) {
+        fprintf(stderr, "active lease allowed truncate (errno=%d)\n", errno);
+        return EXIT_FAILURE;
+    }
+    puts("PASS: active lease denied truncate");
+
+    /* BEGIN removed stale A.  Cache C during the lease, overwrite it behind
+     * ext4 with D, and verify that COMPLETE removes the newly stale C page. */
+    raw_write_pattern(argv[2], physical, 'C', direct);
+    if (pread(file_fd, cached, sizeof(cached), 0) != sizeof(cached))
+        die("buffered read C during lease");
+    require_pattern(cached, 'C', "buffered read during lease");
     raw_write_pattern(argv[2], physical, 'D', direct);
-    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
-    if (control_fd < 0)
-        die("open NDT cache control for second completion");
+
     if (ioctl(control_fd, NDT_CACHE_COMPLETE_RANGE, &range) < 0)
-        die("second NDT_CACHE_COMPLETE_RANGE");
+        die("NDT_CACHE_COMPLETE_RANGE");
     close(control_fd);
     if (pread(file_fd, cached, sizeof(cached), 0) != sizeof(cached))
         die("buffered read after BEGIN/COMPLETE");
     require_pattern(cached, 'D', "buffered read after BEGIN/COMPLETE");
-    puts("PASS: BEGIN removed dirty host state before raw pattern D");
+    puts("PASS: COMPLETE invalidated cache populated during the lease");
+
+    writer_fd = open(argv[1], O_WRONLY | O_CLOEXEC);
+    if (writer_fd < 0)
+        die("writer remained denied after COMPLETE");
+    memset(cached, 'E', sizeof(cached));
+    if (pwrite(writer_fd, cached, sizeof(cached), 0) != sizeof(cached))
+        die("dirty buffered write E");
+    close(writer_fd);
+
+    /* Dirty E remains eligible for writeback after its writer closes.  BEGIN
+     * must write it back and invalidate it before storage writes F. */
+    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0)
+        die("open control for dirty-page test");
+    if (ioctl(control_fd, NDT_CACHE_BEGIN_RANGE, &range) < 0)
+        die("BEGIN for dirty-page test");
+    raw_write_pattern(argv[2], physical, 'F', direct);
+    if (ioctl(control_fd, NDT_CACHE_COMPLETE_RANGE, &range) < 0)
+        die("COMPLETE for dirty-page test");
+    close(control_fd);
+    if (pread(file_fd, cached, sizeof(cached), 0) != sizeof(cached))
+        die("read after dirty-page test");
+    require_pattern(cached, 'F', "dirty-page test result");
+    puts("PASS: BEGIN removed dirty host state before raw pattern F");
+
+    /* Closing a control FD without COMPLETE simulates process cleanup. */
+    control_fd = open(argv[3], O_RDONLY | O_CLOEXEC);
+    if (control_fd < 0)
+        die("open control for release test");
+    if (ioctl(control_fd, NDT_CACHE_BEGIN_RANGE, &range) < 0)
+        die("BEGIN for release test");
+    close(control_fd);
+    writer_fd = open(argv[1], O_WRONLY | O_CLOEXEC);
+    if (writer_fd < 0)
+        die("control-FD release left inode write-denied");
+    close(writer_fd);
+    puts("PASS: control-FD release automatically released the lease");
 
     free(direct);
     close(file_fd);

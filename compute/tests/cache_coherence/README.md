@@ -21,9 +21,10 @@ make
 sudo ./run_loopback_test.sh
 ```
 
-The production protocol must call `NDT_CACHE_BEGIN_RANGE` before exposing the
-output LBA mapping and `NDT_CACHE_COMPLETE_RANGE` only after storage-side NVMe
-writes and the required NVMe Flush have completed.  The module deliberately
-does not implement an access lease yet; all host readers, writers, truncation,
-hole punching, and writable mmap must remain excluded between BEGIN and
-COMPLETE.
+The production protocol keeps one `/dev/ndt_cache` control FD open from
+`NDT_CACHE_BEGIN_RANGE` until `NDT_CACHE_COMPLETE_RANGE`.  BEGIN rejects an
+existing writable FD or writable mmap and denies new writable opens.  COMPLETE
+invalidates the output range and releases the write denial.  Closing the
+control FD without COMPLETE performs best-effort invalidation and automatic
+lease release.  Reads and read-only mmap remain allowed; this is a write/layout
+lease rather than a universal read-blocking file lease.

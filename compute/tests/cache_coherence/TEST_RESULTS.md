@@ -16,15 +16,29 @@ test file in the temporary loop filesystem.
 
 ```text
 OBSERVED stale buffered page after raw physical-block write
-PASS: exact inode/file-offset invalidation exposed raw pattern B
-PASS: BEGIN removed dirty host state before raw pattern D
+PASS: BEGIN rejected an existing writable FD
+PASS: BEGIN rejected an existing writable mmap
+PASS: global registry rejected a second lease on the same inode
+PASS: active lease denied a new writable open
+PASS: active lease denied truncate
+PASS: COMPLETE invalidated cache populated during the lease
+PASS: BEGIN removed dirty host state before raw pattern F
+PASS: control-FD release automatically released the lease
 ```
 
 This establishes both hazards and the intended behavior:
 
-- COMPLETE removes a clean but stale buffered page after an out-of-band write.
-- BEGIN writes back and removes dirty host state before storage obtains the LBA
-  route, so that state cannot later overwrite the storage-side result.
+- BEGIN rejects preexisting writers and writable mappings, and the module-wide
+  inode registry permits only one NDT lease per output file.
+- While the control FD remains open, new writable opens and truncate fail with
+  `ETXTBSY`; operations that require a new writable FD, including hole punch
+  and fallocate-based layout changes, are therefore excluded as well.
+- COMPLETE removes cache populated during storage-side writes, releases write
+  denial, and permits new writers again.
+- Closing the control FD without COMPLETE exercises the same `.release()` path
+  used after process termination and automatically releases the lease.
+- The complete loopback suite was repeated five additional times; all lease
+  acquisition, exclusion, completion, and release checks passed in every run.
 
 ## One-shard NDT-BPE strict smoke test
 
@@ -35,21 +49,31 @@ input_bytes=503327778
 output_valid_bytes=519100232
 tokens=129775058
 nonzero_entry_samples=4103
-breakdown_cache_drop_us=59.887
+runtime_workers=8
+slots=8
+max_inflight=8
+local_wall_s=63.092
+breakdown_cache_drop_us=18.166
+fetch_s=4.426
 sha256=147131246141dea04563cec2459b36e6584d7cab194630531af38663afb92095
 ```
 
 The checksum is identical to the existing Ray-only and NDT-BPE reference
-checksum for the same shard.
+checksum for the same shard.  A separate root process observed `ETXTBSY` when
+opening the real NVMe-oF output file for writing while the lease was active.
+The same writable open succeeded immediately after COMPLETE, and the manifest
+was present only after lease completion.  This run created and initialized a
+new 2,012,487,680-byte output pool, so its wall time is a correctness smoke
+result rather than a replacement performance measurement.
 
 ## Remaining boundary
 
-The module performs exact kernel page-cache range invalidation, but it does not
-yet reject unrelated host reads, writes, truncation, hole punching, or writable
-mmap while the range is lent to storage.  The integration is correct under the
-current single-owner execution rule.  Claiming coherence under arbitrary
-concurrent host access requires an enforced lease or a dedicated unmounted raw
-output namespace.
+The module now enforces a whole-file write/layout lease for host filesystem
+access.  It intentionally does not reject ordinary reads or read-only mmap.
+Correct consumers use the manifest as the publication boundary and therefore
+do not consume an output while its lease is active.  Privileged raw
+block-device access, another host, and storage software outside the NDT route
+remain outside this Compute-kernel lease boundary.
 
 SPDK currently completes each custom command after all extent writes complete,
 but the custom write-back path does not issue a separate NVMe Flush.  The test
